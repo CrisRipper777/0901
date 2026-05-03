@@ -1,0 +1,13 @@
+name: cloth-copurchase
+source: mmgraph
+tasks: [lp]
+
+root: ${paths.data_root}/cloth-copurchase
+joint_feat_path: ${dataset.root}/clip_feat.pt
+edge_split_path: ${dataset.root}/lp-edge-split.pt
+
+feature_dtype: float32
+visual_dim: 512
+text_dim: 512
+make_undirected: true
+add_self_loops: false

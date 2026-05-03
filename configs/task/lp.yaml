@@ -1,0 +1,29 @@
+name: lp
+
+epochs: 50
+lr: 0.001
+weight_decay: 1e-5
+batch_size: 1024
+num_neighbors: [15, 15]
+num_train_neg: 1
+num_eval_neg: 150
+eval_every: 1
+patience: 20
+selection_metric: mrr
+max_train_batches: null
+eval_edge_batch_size: 1024
+
+loss:
+  aux_weight: 1.0
+
+decoder:
+  name: mlp
+  hidden_dim: 256
+  num_layers: 3
+  dropout: 0.2
+
+metrics:
+  - mrr
+  - hits@1
+  - hits@3
+  - hits@10

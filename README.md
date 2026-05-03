@@ -1,0 +1,63 @@
+# MAG_baseline
+
+`MAG_baseline` is a PyTorch / PyG / Hydra baseline framework for multimodal attributed graph experiments.
+
+It only supports:
+
+- Node Classification (NC)
+- Link Prediction (LP)
+
+It uses frozen features from `../data` and does not train BERT, ViT, CLIP, Qwen-VL, or other large encoders.
+
+## Datasets
+
+MAGB:
+
+- `Movies`: NC + LP
+- `Toys`: NC + LP
+- `Grocery`: NC + LP
+- `Reddit-S`: NC + LP
+
+MM-Graph:
+
+- `sports-copurchase`: LP
+- `cloth-copurchase`: LP
+- `books-lp`: LP
+- `ele-fashion`: NC
+- `books-nc`: NC
+
+## Run
+
+Use the requested environment:
+
+```bash
+conda activate yhf_env
+cd /hdd1/DataInHere/YHF/MAG_baseline
+```
+
+Run one NC experiment:
+
+```bash
+python -m src.main dataset=Movies task=nc model=mlp num_runs=3
+```
+
+Run one LP experiment:
+
+```bash
+python -m src.main dataset=sports-copurchase task=lp model=sage num_runs=3
+```
+
+Smoke test with a short run:
+
+```bash
+python -m src.main dataset=Movies task=nc model=mlp num_runs=1 task.epochs=1 task.max_train_batches=2 device=cpu
+```
+
+## Notes
+
+- MAGB `*Graph.pt` files are DGL graphs, so the loader converts DGL graphs to PyG `edge_index`.
+- MAGB NC/LP splits are generated once under `../data/MAGB_split` when missing.
+- MM-Graph NC/LP tasks use the official split files shipped in each dataset directory.
+- LP evaluation ranks one positive target against fixed negative targets and reports MRR / Hits@1 / Hits@3 / Hits@10.
+- `model=mlp` does not use graph sampling: NC uses node mini-batches and LP uses edge mini-batches.
+- GNN models such as `gcn` and `sage` use PyG `NeighborLoader` / `LinkNeighborLoader`.

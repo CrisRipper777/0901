@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from torch_geometric.data import Data
+from torch_geometric.loader import NeighborLoader
 from torch_geometric.nn import SAGEConv
 
 from .common import get_activation, make_norm
@@ -33,3 +35,41 @@ class Model(nn.Module):
                 x = self.dropout(x)
         aux_loss = x.new_tensor(0.0)
         return x, None, None, aux_loss, {}
+
+    @torch.no_grad()
+    def inference(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        device: torch.device | None = None,
+        batch_size: int = 65536,
+    ) -> torch.Tensor:
+        self.eval()
+        if device is None:
+            device = next(self.parameters()).device
+
+        h = x.cpu()
+        edge_index = edge_index.cpu()
+        num_nodes = int(h.size(0))
+        input_nodes = torch.arange(num_nodes, dtype=torch.long)
+
+        for layer_idx, conv in enumerate(self.convs):
+            data = Data(x=h, edge_index=edge_index)
+            loader = NeighborLoader(
+                data,
+                input_nodes=input_nodes,
+                num_neighbors=[-1],
+                batch_size=batch_size,
+                shuffle=False,
+            )
+            out = torch.empty((num_nodes, conv.out_channels), dtype=h.dtype, device="cpu")
+            for batch in loader:
+                batch = batch.to(device)
+                z = conv(batch.x, batch.edge_index)[: batch.batch_size]
+                if layer_idx != len(self.convs) - 1:
+                    z = self.norms[layer_idx](z)
+                    z = self.activation(z)
+                out[batch.n_id[: batch.batch_size].cpu()] = z.detach().cpu()
+            h = out
+
+        return h

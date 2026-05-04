@@ -144,12 +144,10 @@ def _build_edge_loader(cfg, edge_label_index: torch.Tensor, edge_label: torch.Te
 
 
 @torch.no_grad()
-def _embed_all(model, data: MAGData, device: torch.device, uses_graph: bool) -> torch.Tensor:
+def _infer_all(model, data: MAGData, device: torch.device, uses_graph: bool, batch_size: int) -> torch.Tensor:
     model.eval()
-    x = data.x.to(device)
-    edge_index = data.edge_index.to(device) if uses_graph else None
-    z, _, _, _, _ = model(x, edge_index)
-    return z
+    edge_index = data.edge_index if uses_graph else None
+    return model.inference(data.x, edge_index, device=device, batch_size=batch_size)
 
 
 @torch.no_grad()
@@ -172,13 +170,16 @@ def _evaluate_split(
 
     for start in range(0, total, batch_size):
         end = min(start + batch_size, total)
-        src = src_all[start:end].to(device)
-        dst = dst_all[start:end].to(device)
-        neg = neg_all[start:end].to(device)
+        src = src_all[start:end].cpu().long()
+        dst = dst_all[start:end].cpu().long()
+        neg = neg_all[start:end].cpu().long()
 
-        pos_score = predictor.score_pairs(z[src], z[dst])
+        pos_score = predictor.score_pairs(z[src].to(device), z[dst].to(device))
         src_neg = src.view(-1, 1).expand_as(neg).reshape(-1)
-        neg_score = predictor.score_pairs(z[src_neg], z[neg.reshape(-1)]).view(neg.size(0), neg.size(1))
+        neg_score = predictor.score_pairs(
+            z[src_neg].to(device),
+            z[neg.reshape(-1)].to(device),
+        ).view(neg.size(0), neg.size(1))
         greater = (neg_score > pos_score.view(-1, 1)).sum(dim=1).float()
         equal = (neg_score == pos_score.view(-1, 1)).sum(dim=1).float()
         ranks = 1.0 + greater + 0.5 * equal
@@ -195,21 +196,6 @@ def _evaluate_split(
         "hits@3": hits3_sum / denom,
         "hits@10": hits10_sum / denom,
     }
-
-
-@torch.no_grad()
-def _evaluate_lp(
-    model,
-    predictor,
-    data: MAGData,
-    device: torch.device,
-    batch_size: int,
-    uses_graph: bool,
-) -> dict[str, float]:
-    z = _embed_all(model, data, device, uses_graph)
-    valid = _evaluate_split(z, predictor, data.edge_split.valid, device, batch_size)
-    test = _evaluate_split(z, predictor, data.edge_split.test, device, batch_size)
-    return {f"val_{k}": v for k, v in valid.items()} | {f"test_{k}": v for k, v in test.items()}
 
 
 def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Logger, run_id: int) -> dict[str, float]:
@@ -254,6 +240,9 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
     patience_total = int(cfg.task.patience)
     patience_left = patience_total
     max_train_batches = cfg.task.get("max_train_batches")
+    inference_batch_size = int(cfg.task.inference_batch_size)
+    eval_test_each_epoch = bool(cfg.task.get("eval_test_each_epoch", False))
+    test_on_best = bool(cfg.task.get("test_on_best", True))
 
     for epoch in range(1, int(cfg.task.epochs) + 1):
         model.train()
@@ -300,33 +289,51 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
             logger.info("Epoch %05d | Train Loss %.4f", epoch, train_loss)
             continue
 
-        metrics = _evaluate_lp(model, predictor, data, device, int(cfg.task.eval_edge_batch_size), uses_graph)
+        z = _infer_all(model, data, device, uses_graph, inference_batch_size)
+        val_metrics = _evaluate_split(z, predictor, data.edge_split.valid, device, int(cfg.task.eval_edge_batch_size))
         logger.info("Epoch %05d | Train Loss %.4f", epoch, train_loss)
         logger.info(
             "Val MRR %.2f | Val H@1 %.2f | Val H@3 %.2f | Val H@10 %.2f",
-            format_pct(metrics["val_mrr"]),
-            format_pct(metrics["val_hits@1"]),
-            format_pct(metrics["val_hits@3"]),
-            format_pct(metrics["val_hits@10"]),
+            format_pct(val_metrics["mrr"]),
+            format_pct(val_metrics["hits@1"]),
+            format_pct(val_metrics["hits@3"]),
+            format_pct(val_metrics["hits@10"]),
         )
-        logger.info("Test at Current")
-        logger.info(
-            "Test MRR %.2f | Test H@1 %.2f | Test H@3 %.2f | Test H@10 %.2f",
-            format_pct(metrics["test_mrr"]),
-            format_pct(metrics["test_hits@1"]),
-            format_pct(metrics["test_hits@3"]),
-            format_pct(metrics["test_hits@10"]),
-        )
+        current_test: dict[str, float] | None = None
+        if eval_test_each_epoch:
+            current_test = _evaluate_split(
+                z,
+                predictor,
+                data.edge_split.test,
+                device,
+                int(cfg.task.eval_edge_batch_size),
+            )
+            logger.info("Test at Current")
+            logger.info(
+                "Test MRR %.2f | Test H@1 %.2f | Test H@3 %.2f | Test H@10 %.2f",
+                format_pct(current_test["mrr"]),
+                format_pct(current_test["hits@1"]),
+                format_pct(current_test["hits@3"]),
+                format_pct(current_test["hits@10"]),
+            )
 
-        if metrics["val_mrr"] > best_val:
-            best_val = metrics["val_mrr"]
+        if val_metrics["mrr"] > best_val:
+            best_val = val_metrics["mrr"]
             best_test = {
-                "val_mrr": metrics["val_mrr"],
-                "test_mrr": metrics["test_mrr"],
-                "test_hits@1": metrics["test_hits@1"],
-                "test_hits@3": metrics["test_hits@3"],
-                "test_hits@10": metrics["test_hits@10"],
+                "val_mrr": val_metrics["mrr"],
             }
+            if test_on_best or current_test is not None:
+                best_current_test = current_test or _evaluate_split(
+                    z,
+                    predictor,
+                    data.edge_split.test,
+                    device,
+                    int(cfg.task.eval_edge_batch_size),
+                )
+                best_test["test_mrr"] = best_current_test["mrr"]
+                best_test["test_hits@1"] = best_current_test["hits@1"]
+                best_test["test_hits@3"] = best_current_test["hits@3"]
+                best_test["test_hits@10"] = best_current_test["hits@10"]
             best_model_state = clone_state_dict(model)
             best_predictor_state = clone_state_dict(predictor)
             patience_left = patience_total
@@ -339,18 +346,33 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
                 break
 
     if not best_test:
-        metrics = _evaluate_lp(model, predictor, data, device, int(cfg.task.eval_edge_batch_size), uses_graph)
+        z = _infer_all(model, data, device, uses_graph, inference_batch_size)
+        val_metrics = _evaluate_split(z, predictor, data.edge_split.valid, device, int(cfg.task.eval_edge_batch_size))
+        test_metrics = _evaluate_split(z, predictor, data.edge_split.test, device, int(cfg.task.eval_edge_batch_size))
         best_test = {
-            "val_mrr": metrics["val_mrr"],
-            "test_mrr": metrics["test_mrr"],
-            "test_hits@1": metrics["test_hits@1"],
-            "test_hits@3": metrics["test_hits@3"],
-            "test_hits@10": metrics["test_hits@10"],
+            "val_mrr": val_metrics["mrr"],
+            "test_mrr": test_metrics["mrr"],
+            "test_hits@1": test_metrics["hits@1"],
+            "test_hits@3": test_metrics["hits@3"],
+            "test_hits@10": test_metrics["hits@10"],
         }
 
     if best_model_state is not None and best_predictor_state is not None:
         load_state_dict_cpu(model, best_model_state)
         load_state_dict_cpu(predictor, best_predictor_state)
+        if "test_mrr" not in best_test:
+            z = _infer_all(model, data, device, uses_graph, inference_batch_size)
+            test_metrics = _evaluate_split(
+                z,
+                predictor,
+                data.edge_split.test,
+                device,
+                int(cfg.task.eval_edge_batch_size),
+            )
+            best_test["test_mrr"] = test_metrics["mrr"]
+            best_test["test_hits@1"] = test_metrics["hits@1"]
+            best_test["test_hits@3"] = test_metrics["hits@3"]
+            best_test["test_hits@10"] = test_metrics["hits@10"]
 
     logger.info(
         "[Run %d] Best Val MRR %.2f",

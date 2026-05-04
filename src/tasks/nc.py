@@ -7,11 +7,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader as TorchDataLoader
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
+from sklearn.metrics import f1_score
 
 from src.data import MAGData
 from src.models import build_model
 from src.tasks.common import clone_state_dict, load_state_dict_cpu
-from src.utils.metrics import accuracy, format_pct, macro_f1
+from src.utils.metrics import format_pct
 from src.utils.seeds import set_seed
 from src.utils.summary import count_parameters, mean_std
 
@@ -21,26 +22,35 @@ def _uses_graph_encoder(cfg) -> bool:
 
 
 @torch.no_grad()
-def _evaluate(model, classifier, data: MAGData, device: torch.device, uses_graph: bool) -> dict[str, float]:
+def _infer_all(model, data: MAGData, device: torch.device, uses_graph: bool, batch_size: int) -> torch.Tensor:
     model.eval()
-    classifier.eval()
-    x = data.x.to(device)
-    edge_index = data.edge_index.to(device) if uses_graph else None
-    y = data.y.to(device)
-    z, _, _, _, _ = model(x, edge_index)
-    logits = classifier(z)
+    edge_index = data.edge_index if uses_graph else None
+    return model.inference(data.x, edge_index, device=device, batch_size=batch_size)
 
-    results: dict[str, float] = {}
-    for split_name, idx in {
-        "val": data.val_idx,
-        "test": data.test_idx,
-    }.items():
-        split_idx = idx.to(device)
-        split_logits = logits[split_idx]
-        split_y = y[split_idx]
-        results[f"{split_name}_acc"] = accuracy(split_logits, split_y)
-        results[f"{split_name}_macro_f1"] = macro_f1(split_logits, split_y)
-    return results
+
+@torch.no_grad()
+def _evaluate_split(
+    classifier,
+    z: torch.Tensor,
+    labels: torch.Tensor,
+    idx: torch.Tensor,
+    device: torch.device,
+    batch_size: int,
+) -> dict[str, float]:
+    classifier.eval()
+    preds: list[torch.Tensor] = []
+    targets: list[torch.Tensor] = []
+    for batch_idx in TorchDataLoader(idx.cpu(), batch_size=batch_size, shuffle=False):
+        logits = classifier(z[batch_idx].to(device))
+        preds.append(logits.argmax(dim=-1).cpu())
+        targets.append(labels[batch_idx].cpu())
+
+    pred = torch.cat(preds, dim=0)
+    target = torch.cat(targets, dim=0)
+    return {
+        "acc": float((pred == target).float().mean().item()),
+        "macro_f1": float(f1_score(target.numpy(), pred.numpy(), average="macro", zero_division=0)),
+    }
 
 
 def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Logger, run_id: int) -> dict[str, float]:
@@ -95,6 +105,9 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
     patience_total = int(cfg.task.patience)
     patience_left = patience_total
     max_train_batches = cfg.task.get("max_train_batches")
+    inference_batch_size = int(cfg.task.inference_batch_size)
+    eval_test_each_epoch = bool(cfg.task.get("eval_test_each_epoch", False))
+    test_on_best = bool(cfg.task.get("test_on_best", True))
 
     for epoch in range(1, int(cfg.task.epochs) + 1):
         model.train()
@@ -127,28 +140,41 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
             logger.info("Epoch %05d | Train Loss %.4f", epoch, train_loss)
             continue
 
-        metrics = _evaluate(model, classifier, data, device, uses_graph)
+        z = _infer_all(model, data, device, uses_graph, inference_batch_size)
+        val_metrics = _evaluate_split(classifier, z, data.y, data.val_idx, device, inference_batch_size)
         logger.info("Epoch %05d | Train Loss %.4f", epoch, train_loss)
         logger.info(
             "Val Acc %.2f | Val F1 %.2f",
-            format_pct(metrics["val_acc"]),
-            format_pct(metrics["val_macro_f1"]),
+            format_pct(val_metrics["acc"]),
+            format_pct(val_metrics["macro_f1"]),
         )
-        logger.info("Test at Current")
-        logger.info(
-            "Test Acc %.2f | Test F1 %.2f",
-            format_pct(metrics["test_acc"]),
-            format_pct(metrics["test_macro_f1"]),
-        )
+        current_test: dict[str, float] | None = None
+        if eval_test_each_epoch:
+            current_test = _evaluate_split(classifier, z, data.y, data.test_idx, device, inference_batch_size)
+            logger.info("Test at Current")
+            logger.info(
+                "Test Acc %.2f | Test F1 %.2f",
+                format_pct(current_test["acc"]),
+                format_pct(current_test["macro_f1"]),
+            )
 
-        if metrics["val_acc"] > best_val:
-            best_val = metrics["val_acc"]
+        if val_metrics["acc"] > best_val:
+            best_val = val_metrics["acc"]
             best_test = {
-                "test_acc": metrics["test_acc"],
-                "test_macro_f1": metrics["test_macro_f1"],
-                "val_acc": metrics["val_acc"],
-                "val_macro_f1": metrics["val_macro_f1"],
+                "val_acc": val_metrics["acc"],
+                "val_macro_f1": val_metrics["macro_f1"],
             }
+            if test_on_best:
+                best_current_test = current_test or _evaluate_split(
+                    classifier,
+                    z,
+                    data.y,
+                    data.test_idx,
+                    device,
+                    inference_batch_size,
+                )
+                best_test["test_acc"] = best_current_test["acc"]
+                best_test["test_macro_f1"] = best_current_test["macro_f1"]
             best_model_state = clone_state_dict(model)
             best_head_state = clone_state_dict(classifier)
             patience_left = patience_total
@@ -161,17 +187,24 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
                 break
 
     if not best_test:
-        metrics = _evaluate(model, classifier, data, device, uses_graph)
+        z = _infer_all(model, data, device, uses_graph, inference_batch_size)
+        val_metrics = _evaluate_split(classifier, z, data.y, data.val_idx, device, inference_batch_size)
+        test_metrics = _evaluate_split(classifier, z, data.y, data.test_idx, device, inference_batch_size)
         best_test = {
-            "test_acc": metrics["test_acc"],
-            "test_macro_f1": metrics["test_macro_f1"],
-            "val_acc": metrics["val_acc"],
-            "val_macro_f1": metrics["val_macro_f1"],
+            "test_acc": test_metrics["acc"],
+            "test_macro_f1": test_metrics["macro_f1"],
+            "val_acc": val_metrics["acc"],
+            "val_macro_f1": val_metrics["macro_f1"],
         }
 
     if best_model_state is not None and best_head_state is not None:
         load_state_dict_cpu(model, best_model_state)
         load_state_dict_cpu(classifier, best_head_state)
+        if "test_acc" not in best_test or "test_macro_f1" not in best_test:
+            z = _infer_all(model, data, device, uses_graph, inference_batch_size)
+            test_metrics = _evaluate_split(classifier, z, data.y, data.test_idx, device, inference_batch_size)
+            best_test["test_acc"] = test_metrics["acc"]
+            best_test["test_macro_f1"] = test_metrics["macro_f1"]
 
     logger.info(
         "[Run %d] Best Val Acc %.2f",

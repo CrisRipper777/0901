@@ -31,3 +31,21 @@ class Model(nn.Module):
         z = self.encoder(x)
         aux_loss = z.new_tensor(0.0)
         return z, None, None, aux_loss, {}
+
+    @torch.no_grad()
+    def inference(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor | None = None,
+        device: torch.device | None = None,
+        batch_size: int = 65536,
+    ) -> torch.Tensor:
+        self.eval()
+        if device is None:
+            device = next(self.parameters()).device
+        outputs = torch.empty((x.size(0), self.out_dim), dtype=x.dtype, device="cpu")
+        for start in range(0, x.size(0), batch_size):
+            end = min(start + batch_size, x.size(0))
+            z, _, _, _, _ = self.forward(x[start:end].to(device), None)
+            outputs[start:end] = z.detach().cpu()
+        return outputs

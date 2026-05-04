@@ -7,7 +7,10 @@ batch_size: 1024
 num_neighbors: [15, 15]
 num_train_neg: 1
 num_eval_neg: 150
+inference_batch_size: 4096
 eval_every: 1
+eval_test_each_epoch: false
+test_on_best: true
 patience: 20
 selection_metric: mrr
 max_train_batches: null

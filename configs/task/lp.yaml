@@ -3,18 +3,19 @@ name: lp
 epochs: 50
 lr: 0.001
 weight_decay: 1e-5
-batch_size: 1024
-num_neighbors: [15, 15]
+batch_size: 2048
+num_neighbors: [5, 5, 5]
 num_train_neg: 1
 num_eval_neg: 150
 inference_batch_size: 4096
+eval_preload_node_emb: true
 eval_every: 1
 eval_test_each_epoch: false
 test_on_best: true
 patience: 20
 selection_metric: mrr
 max_train_batches: null
-eval_edge_batch_size: 1024
+eval_edge_batch_size: 2048
 
 loss:
   aux_weight: 1.0

@@ -17,8 +17,9 @@ from src.utils.device import get_device
 from src.utils.logging import setup_logger
 
 
-def _log_data_info(logger, data) -> None:
+def _log_data_info(logger, data, model_name: str) -> None:
     logger.info("Dataset: %s | Source: %s | Task: %s", data.name, data.source, data.task)
+    logger.info("Model: %s", model_name)
     logger.info("X: %s | dtype=%s", tuple(data.x.shape), data.x.dtype)
     if data.x_i is not None:
         logger.info("X_i: %s | X_t: %s", tuple(data.x_i.shape), tuple(data.x_t.shape))
@@ -55,7 +56,7 @@ def main(cfg: DictConfig) -> None:
     logger.info("Device: %s", device)
 
     data = load_mag_data(cfg, str(cfg.task.name), int(cfg.seed))
-    _log_data_info(logger, data)
+    _log_data_info(logger, data, str(cfg.model.name))
 
     if int(cfg.task.epochs) <= 0:
         logger.info("task.epochs <= 0, stopping after data loading/split preparation")

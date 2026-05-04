@@ -150,6 +150,17 @@ def _infer_all(model, data: MAGData, device: torch.device, uses_graph: bool, bat
     return model.inference(data.x, edge_index, device=device, batch_size=batch_size)
 
 
+def _prepare_eval_embeddings(
+    z: torch.Tensor,
+    device: torch.device,
+    preload: bool,
+    logger: logging.Logger,
+) -> torch.Tensor:
+    z_eval = z.to(device, non_blocking=True) if preload else z
+    logger.info("Eval node embeddings: preload=%s | device=%s | shape=%s", preload, z_eval.device, tuple(z_eval.shape))
+    return z_eval
+
+
 @torch.no_grad()
 def _evaluate_split(
     z: torch.Tensor,
@@ -170,16 +181,27 @@ def _evaluate_split(
 
     for start in range(0, total, batch_size):
         end = min(start + batch_size, total)
-        src = src_all[start:end].cpu().long()
-        dst = dst_all[start:end].cpu().long()
-        neg = neg_all[start:end].cpu().long()
+        if z.device.type == "cuda":
+            src = src_all[start:end].to(z.device, non_blocking=True).long()
+            dst = dst_all[start:end].to(z.device, non_blocking=True).long()
+            neg = neg_all[start:end].to(z.device, non_blocking=True).long()
+            pos_src = z[src]
+            pos_dst = z[dst]
+            src_neg = src.view(-1, 1).expand_as(neg).reshape(-1)
+            neg_src = z[src_neg]
+            neg_dst = z[neg.reshape(-1)]
+        else:
+            src = src_all[start:end].cpu().long()
+            dst = dst_all[start:end].cpu().long()
+            neg = neg_all[start:end].cpu().long()
+            pos_src = z[src].to(device, non_blocking=True)
+            pos_dst = z[dst].to(device, non_blocking=True)
+            src_neg = src.view(-1, 1).expand_as(neg).reshape(-1)
+            neg_src = z[src_neg].to(device, non_blocking=True)
+            neg_dst = z[neg.reshape(-1)].to(device, non_blocking=True)
 
-        pos_score = predictor.score_pairs(z[src].to(device), z[dst].to(device))
-        src_neg = src.view(-1, 1).expand_as(neg).reshape(-1)
-        neg_score = predictor.score_pairs(
-            z[src_neg].to(device),
-            z[neg.reshape(-1)].to(device),
-        ).view(neg.size(0), neg.size(1))
+        pos_score = predictor.score_pairs(pos_src, pos_dst)
+        neg_score = predictor.score_pairs(neg_src, neg_dst).view(neg.size(0), neg.size(1))
         greater = (neg_score > pos_score.view(-1, 1)).sum(dim=1).float()
         equal = (neg_score == pos_score.view(-1, 1)).sum(dim=1).float()
         ranks = 1.0 + greater + 0.5 * equal
@@ -241,8 +263,10 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
     patience_left = patience_total
     max_train_batches = cfg.task.get("max_train_batches")
     inference_batch_size = int(cfg.task.inference_batch_size)
+    eval_preload_node_emb = bool(cfg.task.get("eval_preload_node_emb", False))
     eval_test_each_epoch = bool(cfg.task.get("eval_test_each_epoch", False))
     test_on_best = bool(cfg.task.get("test_on_best", True))
+    logger.info("LP eval preload node embeddings: %s", eval_preload_node_emb)
 
     for epoch in range(1, int(cfg.task.epochs) + 1):
         model.train()
@@ -290,7 +314,8 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
             continue
 
         z = _infer_all(model, data, device, uses_graph, inference_batch_size)
-        val_metrics = _evaluate_split(z, predictor, data.edge_split.valid, device, int(cfg.task.eval_edge_batch_size))
+        z_eval = _prepare_eval_embeddings(z, device, eval_preload_node_emb, logger)
+        val_metrics = _evaluate_split(z_eval, predictor, data.edge_split.valid, device, int(cfg.task.eval_edge_batch_size))
         logger.info("Epoch %05d | Train Loss %.4f", epoch, train_loss)
         logger.info(
             "Val MRR %.2f | Val H@1 %.2f | Val H@3 %.2f | Val H@10 %.2f",
@@ -302,7 +327,7 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
         current_test: dict[str, float] | None = None
         if eval_test_each_epoch:
             current_test = _evaluate_split(
-                z,
+                z_eval,
                 predictor,
                 data.edge_split.test,
                 device,
@@ -317,6 +342,7 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
                 format_pct(current_test["hits@10"]),
             )
 
+        stop_early = False
         if val_metrics["mrr"] > best_val:
             best_val = val_metrics["mrr"]
             best_test = {
@@ -324,7 +350,7 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
             }
             if test_on_best or current_test is not None:
                 best_current_test = current_test or _evaluate_split(
-                    z,
+                    z_eval,
                     predictor,
                     data.edge_split.test,
                     device,
@@ -343,12 +369,18 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
             logger.info("Patience %d/%d | Best Val MRR %.2f", patience_used, patience_total, format_pct(best_val))
             if patience_left <= 0:
                 logger.info("Early stopping at epoch %03d", epoch)
-                break
+                stop_early = True
+
+        del z_eval
+        del z
+        if stop_early:
+            break
 
     if not best_test:
         z = _infer_all(model, data, device, uses_graph, inference_batch_size)
-        val_metrics = _evaluate_split(z, predictor, data.edge_split.valid, device, int(cfg.task.eval_edge_batch_size))
-        test_metrics = _evaluate_split(z, predictor, data.edge_split.test, device, int(cfg.task.eval_edge_batch_size))
+        z_eval = _prepare_eval_embeddings(z, device, eval_preload_node_emb, logger)
+        val_metrics = _evaluate_split(z_eval, predictor, data.edge_split.valid, device, int(cfg.task.eval_edge_batch_size))
+        test_metrics = _evaluate_split(z_eval, predictor, data.edge_split.test, device, int(cfg.task.eval_edge_batch_size))
         best_test = {
             "val_mrr": val_metrics["mrr"],
             "test_mrr": test_metrics["mrr"],
@@ -362,8 +394,9 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
         load_state_dict_cpu(predictor, best_predictor_state)
         if "test_mrr" not in best_test:
             z = _infer_all(model, data, device, uses_graph, inference_batch_size)
+            z_eval = _prepare_eval_embeddings(z, device, eval_preload_node_emb, logger)
             test_metrics = _evaluate_split(
-                z,
+                z_eval,
                 predictor,
                 data.edge_split.test,
                 device,

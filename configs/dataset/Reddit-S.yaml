@@ -9,7 +9,7 @@ image_feat_path: ${paths.data_root}/Reddit-S/ImageFeature/RedditS_openai_clip-vi
 num_classes: 20
 feature_dtype: float32
 make_undirected: true
-add_self_loops: true
+add_self_loops: false
 
 nc_split_path: ${paths.split_root}/Reddit-S_nc_seed${seed}_train0.6_val0.2.pt
 lp_split_path: ${paths.split_root}/Reddit-S_lp_seed${seed}_val0.2_test0.2_neg150_filtered1.pt

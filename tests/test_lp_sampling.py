@@ -3,7 +3,11 @@ from __future__ import annotations
 import torch
 
 from src.data import EdgeSplit
-from src.tasks.lp import _build_epoch_train_labels, _build_forbidden_edge_keys
+from src.tasks.lp import (
+    _build_epoch_train_labels,
+    _build_forbidden_edge_keys,
+    _exclude_positive_label_edges_from_message_graph,
+)
 
 
 def _pack(src: list[int], dst: list[int]) -> dict[str, torch.Tensor]:
@@ -41,3 +45,30 @@ def test_epoch_train_negative_edges_are_globally_filtered() -> None:
         assert (src, dst) not in positive_pairs
         per_source.setdefault(src, []).append(dst)
     assert all(len(targets) == len(set(targets)) for targets in per_source.values())
+
+
+def test_positive_label_edges_are_excluded_from_message_graph() -> None:
+    message_edge_index = torch.tensor(
+        [
+            [0, 1, 0, 2, 3, 4, 5],
+            [1, 0, 2, 0, 4, 3, 0],
+        ],
+        dtype=torch.long,
+    )
+    edge_label_index = torch.tensor(
+        [
+            [0, 3],
+            [1, 5],
+        ],
+        dtype=torch.long,
+    )
+    edge_label = torch.tensor([1.0, 0.0])
+
+    filtered = _exclude_positive_label_edges_from_message_graph(
+        message_edge_index,
+        edge_label_index,
+        edge_label,
+        num_nodes=6,
+    )
+
+    assert filtered.tolist() == [[0, 2, 3, 4, 5], [2, 0, 4, 3, 0]]

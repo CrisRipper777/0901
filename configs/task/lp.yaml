@@ -4,16 +4,12 @@ epochs: 50
 lr: 0.001
 weight_decay: 1e-5
 batch_size: 2048
-num_neighbors: [5, 5, 5]
+num_neighbors: [15, 5, 5]
 num_train_neg: 1
-num_eval_neg: 150
 inference_batch_size: 4096
 eval_preload_node_emb: true
 eval_every: 1
-eval_test_each_epoch: false
-test_on_best: true
 patience: 20
-selection_metric: mrr
 max_train_batches: null
 eval_edge_batch_size: 2048
 
@@ -24,10 +20,4 @@ decoder:
   name: mlp
   hidden_dim: 256
   num_layers: 3
-  dropout: 0.2
-
-metrics:
-  - mrr
-  - hits@1
-  - hits@3
-  - hits@10
+  dropout: 0.02

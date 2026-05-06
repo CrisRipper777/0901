@@ -59,5 +59,7 @@ python -m src.main dataset=Movies task=nc model=mlp num_runs=1 task.epochs=1 tas
 - MAGB NC/LP splits are generated once under `../data/MAGB_split` when missing.
 - MM-Graph NC/LP tasks use the official split files shipped in each dataset directory.
 - LP evaluation ranks one positive target against fixed negative targets and reports MRR / Hits@1 / Hits@3 / Hits@10.
+- Test metrics are computed once after training, by reloading the best validation checkpoint.
+- Dataset graphs do not add self-loops by default; models own their self-loop policy, e.g. GCN adds them internally.
 - `model=mlp` does not use graph sampling: NC uses node mini-batches and LP uses edge mini-batches.
 - GNN models such as `gcn` and `sage` use PyG `NeighborLoader` / `LinkNeighborLoader`.

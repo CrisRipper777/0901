@@ -14,4 +14,4 @@ feature_dtype: float32
 visual_dim: 512
 text_dim: 512
 make_undirected: true
-add_self_loops: true
+add_self_loops: false

@@ -7,7 +7,7 @@ batch_size: 1024
 num_neighbors: [15, 15, 15]
 inference_batch_size: 4096
 eval_every: 1
-patience: 30
+patience: 20
 max_train_batches: null
 
 loss:

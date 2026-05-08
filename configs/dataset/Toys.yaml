@@ -5,6 +5,7 @@ tasks: [nc, lp]
 graph_path: ${paths.data_root}/Toys/ToysGraph.pt
 text_feat_path: ${paths.data_root}/Toys/TextFeature/Toys_roberta_base_512_mean.npy
 image_feat_path: ${paths.data_root}/Toys/ImageFeature/Toys_openai_clip-vit-large-patch14.npy
+# Loaded data.x modality order is [x_t, x_i] to match MM-Graph *_feat.pt order.
 
 num_classes: 18
 feature_dtype: float32

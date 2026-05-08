@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from src.models import gcn, mlp, sage
+from src.models import gcn, mlp, mmgcn, sage
 
 
 class _CfgNode(dict):
@@ -18,6 +18,7 @@ def _cfg() -> _CfgNode:
             dropout=0.0,
             activation="relu",
             norm="none",
+            aggr="mean",
         )
     )
 
@@ -86,3 +87,37 @@ def test_gcn_layerwise_inference_matches_full_batch_forward() -> None:
 
     assert inferred.shape == full.shape
     assert max_abs_diff < 1e-4
+
+
+def test_mmgcn_layerwise_inference_matches_full_batch_forward() -> None:
+    _, edge_index = _small_graph()
+    x = torch.arange(60, dtype=torch.float32).view(6, 10) / 10.0
+    torch.manual_seed(123)
+    model = mmgcn.Model(_cfg(), {"input_dim": 10, "num_nodes": 6, "text_dim": 4, "visual_dim": 6})
+    model.eval()
+
+    full, inferred, max_abs_diff = _compare_full_and_inference(model, x, edge_index)
+
+    assert inferred.shape == full.shape
+    assert max_abs_diff < 1e-4
+
+
+def test_mmgcn_uses_global_batch_node_ids_for_id_embeddings() -> None:
+    torch.manual_seed(123)
+    model = mmgcn.Model(_cfg(), {"input_dim": 10, "num_nodes": 8, "text_dim": 4, "visual_dim": 6})
+    n_id = torch.tensor([3, 7, 1, 4], dtype=torch.long)
+
+    assert model._batch_n_id is None
+    model._batch_n_id = n_id
+
+    assert torch.equal(model._get_id_emb(n_id.numel()), model.id_embedding[n_id])
+
+
+def test_mmgcn_honors_dropout_config() -> None:
+    cfg = _cfg()
+    cfg.model["dropout"] = 0.37
+
+    model = mmgcn.Model(cfg, {"input_dim": 10, "num_nodes": 8, "text_dim": 4, "visual_dim": 6})
+
+    assert model.v_branch.dropout.p == 0.37
+    assert model.t_branch.dropout.p == 0.37

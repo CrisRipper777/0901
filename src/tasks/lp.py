@@ -245,7 +245,13 @@ def _evaluate_split(
 def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Logger, run_id: int) -> dict[str, float]:
     seed = int(cfg.seed) + run_id
     set_seed(seed)
-    data_info = {"input_dim": data.input_dim, "num_nodes": data.num_nodes, "num_classes": data.num_classes}
+    data_info = {
+        "input_dim": data.input_dim,
+        "num_nodes": data.num_nodes,
+        "num_classes": data.num_classes,
+        "text_dim": int(data.x_t.shape[1]) if data.x_t is not None else 0,
+        "visual_dim": int(data.x_i.shape[1]) if data.x_i is not None else 0,
+    }
     model = build_model(cfg, data_info).to(device)
     predictor = LinkPredictor(
         in_dim=model.out_dim,
@@ -311,6 +317,8 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
             optimizer.zero_grad(set_to_none=True)
             if uses_graph:
                 batch = batch.to(device)
+                if hasattr(model, "_batch_n_id"):
+                    model._batch_n_id = batch.n_id
                 message_edge_index = _exclude_positive_label_edges_from_message_graph(
                     batch.edge_index,
                     batch.edge_label_index,

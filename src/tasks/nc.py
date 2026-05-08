@@ -57,7 +57,13 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
     seed = int(cfg.seed) + run_id
     set_seed(seed)
 
-    data_info = {"input_dim": data.input_dim, "num_nodes": data.num_nodes, "num_classes": data.num_classes}
+    data_info = {
+        "input_dim": data.input_dim,
+        "num_nodes": data.num_nodes,
+        "num_classes": data.num_classes,
+        "text_dim": int(data.x_t.shape[1]) if data.x_t is not None else 0,
+        "visual_dim": int(data.x_i.shape[1]) if data.x_i is not None else 0,
+    }
     model = build_model(cfg, data_info).to(device)
     classifier = nn.Linear(model.out_dim, int(data.num_classes)).to(device)
     optimizer = torch.optim.Adam(
@@ -118,6 +124,8 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
             optimizer.zero_grad(set_to_none=True)
             if uses_graph:
                 batch = batch.to(device)
+                if hasattr(model, "_batch_n_id"):
+                    model._batch_n_id = batch.n_id
                 z, _, _, aux_loss, _ = model(batch.x, batch.edge_index)
                 logits = classifier(z[: batch.batch_size])
                 labels = batch.y[: batch.batch_size]

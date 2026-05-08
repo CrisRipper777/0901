@@ -5,6 +5,7 @@ tasks: [nc, lp]
 graph_path: ${paths.data_root}/Grocery/GroceryGraph.pt
 text_feat_path: ${paths.data_root}/Grocery/TextFeature/Grocery_roberta_base_256_mean.npy
 image_feat_path: ${paths.data_root}/Grocery/ImageFeature/Grocery_openai_clip-vit-large-patch14.npy
+# Loaded data.x modality order is [x_t, x_i] to match MM-Graph *_feat.pt order.
 
 num_classes: 20
 feature_dtype: float32

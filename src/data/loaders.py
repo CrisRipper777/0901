@@ -73,8 +73,8 @@ def _normalize_split_dict(raw: dict[str, Any]) -> EdgeSplit:
 
 def _split_modalities_from_joint(
     x: torch.Tensor,
-    visual_dim: int | None,
     text_dim: int | None,
+    visual_dim: int | None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     if not visual_dim or not text_dim:
         return None, None
@@ -82,8 +82,8 @@ def _split_modalities_from_joint(
         raise ValueError(
             f"joint feature dim {x.size(1)} is smaller than visual_dim+text_dim={visual_dim + text_dim}"
         )
-    x_i = x[:, :visual_dim].contiguous()
-    x_t = x[:, visual_dim : visual_dim + text_dim].contiguous()
+    x_t = x[:, :text_dim].contiguous()
+    x_i = x[:, text_dim : text_dim + visual_dim].contiguous()
     return x_i, x_t
 
 
@@ -101,7 +101,7 @@ def _load_magb(cfg: DictConfig, task_name: str, seed: int) -> MAGData:
             f"{ds.name}: feature/node mismatch: image={tuple(image_feat.shape)}, "
             f"text={tuple(text_feat.shape)}, num_nodes={num_nodes}"
         )
-    x = torch.cat([image_feat, text_feat], dim=1).contiguous()
+    x = torch.cat([text_feat, image_feat], dim=1).contiguous()
 
     if task_name == "nc":
         split = load_or_create_nc_split(
@@ -179,8 +179,8 @@ def _load_mmgraph(cfg: DictConfig, task_name: str) -> MAGData:
     num_nodes = int(x.size(0))
     x_i, x_t = _split_modalities_from_joint(
         x,
-        int(ds.visual_dim) if "visual_dim" in ds else None,
         int(ds.text_dim) if "text_dim" in ds else None,
+        int(ds.visual_dim) if "visual_dim" in ds else None,
     )
 
     if task_name == "nc":

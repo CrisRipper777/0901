@@ -12,6 +12,7 @@ from sklearn.metrics import f1_score
 from src.data import MAGData
 from src.models import build_model
 from src.tasks.common import clone_state_dict, load_state_dict_cpu
+from src.tasks.inference import infer_all_embeddings, resolve_inference_mode
 from src.utils.metrics import format_pct
 from src.utils.seeds import set_seed
 from src.utils.summary import count_parameters, mean_std
@@ -19,13 +20,6 @@ from src.utils.summary import count_parameters, mean_std
 
 def _uses_graph_encoder(cfg) -> bool:
     return str(cfg.model.name).lower() != "mlp"
-
-
-@torch.no_grad()
-def _infer_all(model, data: MAGData, device: torch.device, uses_graph: bool, batch_size: int) -> torch.Tensor:
-    model.eval()
-    edge_index = data.edge_index if uses_graph else None
-    return model.inference(data.x, edge_index, device=device, batch_size=batch_size)
 
 
 @torch.no_grad()
@@ -56,6 +50,7 @@ def _evaluate_split(
 def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Logger, run_id: int) -> dict[str, float]:
     seed = int(cfg.seed) + run_id
     set_seed(seed)
+    inference_mode = resolve_inference_mode(cfg)
 
     data_info = {
         "input_dim": data.input_dim,
@@ -102,6 +97,7 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
         count_parameters(model) + count_parameters(classifier),
     )
     logger.info("Loader: %s", loader_name)
+    logger.info("Inference mode: %s", inference_mode)
     logger.info("Training...")
 
     best_val = -1.0
@@ -146,7 +142,7 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
             logger.info("Epoch %05d | Train Loss %.4f", epoch, train_loss)
             continue
 
-        z = _infer_all(model, data, device, uses_graph, inference_batch_size)
+        z = infer_all_embeddings(model, data, device, uses_graph, inference_batch_size, inference_mode)
         val_metrics = _evaluate_split(classifier, z, data.y, data.val_idx, device, inference_batch_size)
         logger.info("Epoch %05d | Train Loss %.4f", epoch, train_loss)
         logger.info(
@@ -175,13 +171,13 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
     if best_model_state is not None and best_head_state is not None:
         load_state_dict_cpu(model, best_model_state)
         load_state_dict_cpu(classifier, best_head_state)
-        z = _infer_all(model, data, device, uses_graph, inference_batch_size)
+        z = infer_all_embeddings(model, data, device, uses_graph, inference_batch_size, inference_mode)
         test_metrics = _evaluate_split(classifier, z, data.y, data.test_idx, device, inference_batch_size)
         best_test["test_acc"] = test_metrics["acc"]
         best_test["test_macro_f1"] = test_metrics["macro_f1"]
 
     if not best_test:
-        z = _infer_all(model, data, device, uses_graph, inference_batch_size)
+        z = infer_all_embeddings(model, data, device, uses_graph, inference_batch_size, inference_mode)
         val_metrics = _evaluate_split(classifier, z, data.y, data.val_idx, device, inference_batch_size)
         test_metrics = _evaluate_split(classifier, z, data.y, data.test_idx, device, inference_batch_size)
         best_test = {

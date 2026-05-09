@@ -9,6 +9,8 @@ from torch_geometric.loader import NeighborLoader
 from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.nn.inits import uniform
 
+from .common import make_norm
+
 
 # ---------------------------------------------------------------------------
 # BaseModel: simple message passing, no normalization/self-loops
@@ -49,6 +51,7 @@ class MMGCNBranch(nn.Module):
         num_layers: int,
         aggr: str = "mean",
         dropout: float = 0.0,
+        norm: str | None = "batchnorm",
         has_mlp: bool = False,
         mlp_dim: int = 256,
     ):
@@ -56,6 +59,7 @@ class MMGCNBranch(nn.Module):
         self.has_mlp = has_mlp
         self.num_layers = num_layers
         self.dropout = nn.Dropout(dropout)
+        self.norms = nn.ModuleList([make_norm(norm, dim_id) for _ in range(max(num_layers - 1, 0))])
         first_dim = mlp_dim if has_mlp else in_dim
 
         if has_mlp:
@@ -91,8 +95,12 @@ class MMGCNBranch(nn.Module):
             g = getattr(self, f"g{i}")
             h = F.leaky_relu(conv(x, edge_index))
             x_hat = F.leaky_relu(linear(x)) + id_emb
-            x = F.leaky_relu(g(h) + x_hat)
-            x = self.dropout(x)
+            x = g(h) + x_hat
+            if i != self.num_layers:
+                x = self.norms[i - 1](x)
+            x = F.leaky_relu(x)
+            if i != self.num_layers:
+                x = self.dropout(x)
 
         return x
 
@@ -111,6 +119,7 @@ class Model(nn.Module):
         num_layers = int(cfg.model.get("num_layers", 3))
         aggr = str(cfg.model.get("aggr", "mean"))
         dropout = float(cfg.model.get("dropout", 0.0))
+        norm = cfg.model.get("norm", "batchnorm")
 
         # MAG_baseline stores joint features in mm-graph-benchmark order: [text, visual].
         self.text_dim = int(data_info.get("text_dim", 0) or 0)
@@ -135,6 +144,7 @@ class Model(nn.Module):
             num_layers=num_layers,
             aggr=aggr,
             dropout=dropout,
+            norm=norm,
             has_mlp=True,
             mlp_dim=256,
         )
@@ -145,6 +155,7 @@ class Model(nn.Module):
             num_layers=num_layers,
             aggr=aggr,
             dropout=dropout,
+            norm=norm,
             has_mlp=False,
         )
 
@@ -202,7 +213,10 @@ class Model(nn.Module):
                 id_emb = self.id_embedding[batch.n_id]
                 h_g = F.leaky_relu(conv(batch.x, batch.edge_index))
                 x_hat = F.leaky_relu(linear(batch.x)) + id_emb
-                z = F.leaky_relu(g(h_g) + x_hat)[: batch.batch_size]
+                z = g(h_g) + x_hat
+                if i != self.v_branch.num_layers:
+                    z = self.v_branch.norms[i - 1](z)
+                z = F.leaky_relu(z)[: batch.batch_size]
                 out[batch.n_id[: batch.batch_size].cpu()] = z.detach().cpu()
             h = out
 
@@ -228,7 +242,10 @@ class Model(nn.Module):
                 id_emb = self.id_embedding[batch.n_id]
                 h_g = F.leaky_relu(conv(batch.x, batch.edge_index))
                 x_hat = F.leaky_relu(linear(batch.x)) + id_emb
-                z = F.leaky_relu(g(h_g) + x_hat)[: batch.batch_size]
+                z = g(h_g) + x_hat
+                if i != self.t_branch.num_layers:
+                    z = self.t_branch.norms[i - 1](z)
+                z = F.leaky_relu(z)[: batch.batch_size]
                 out[batch.n_id[: batch.batch_size].cpu()] = z.detach().cpu()
             h = out
 

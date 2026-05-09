@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
+import pytest
 
+from src.data import MAGData
 from src.models import gcn, mlp, mmgcn, sage
+from src.tasks.inference import infer_all_embeddings, resolve_inference_mode
 
 
 class _CfgNode(dict):
@@ -17,7 +21,7 @@ def _cfg() -> _CfgNode:
             num_layers=2,
             dropout=0.0,
             activation="relu",
-            norm="none",
+            norm="batchnorm",
             aggr="mean",
         )
     )
@@ -53,9 +57,34 @@ def _build_model(model_cls):
 
 
 def _compare_full_and_inference(model, x: torch.Tensor, edge_index: torch.Tensor | None):
+    graph_edge_index = edge_index if edge_index is not None else torch.empty((2, 0), dtype=torch.long)
+    data = MAGData(
+        name="small",
+        source="test",
+        task="test",
+        x=x,
+        edge_index=graph_edge_index,
+        num_nodes=int(x.size(0)),
+    )
     with torch.no_grad():
-        full = model(x, edge_index)[0].detach().cpu()
-        inferred = model.inference(x, edge_index, device=torch.device("cpu"), batch_size=2)
+        model.eval()
+        full = infer_all_embeddings(
+            model,
+            data,
+            device=torch.device("cpu"),
+            uses_graph=edge_index is not None,
+            batch_size=2,
+            inference_mode="full",
+        )
+        model.eval()
+        inferred = infer_all_embeddings(
+            model,
+            data,
+            device=torch.device("cpu"),
+            uses_graph=edge_index is not None,
+            batch_size=2,
+            inference_mode="layerwise",
+        )
     return full, inferred, float((full - inferred).abs().max().item())
 
 
@@ -121,3 +150,33 @@ def test_mmgcn_honors_dropout_config() -> None:
 
     assert model.v_branch.dropout.p == 0.37
     assert model.t_branch.dropout.p == 0.37
+
+
+def test_mmgcn_honors_norm_config() -> None:
+    cfg = _cfg()
+    cfg.model["norm"] = "batchnorm"
+    model = mmgcn.Model(cfg, {"input_dim": 10, "num_nodes": 8, "text_dim": 4, "visual_dim": 6})
+
+    assert isinstance(model.v_branch.norms[0], nn.BatchNorm1d)
+    assert isinstance(model.t_branch.norms[0], nn.BatchNorm1d)
+
+    cfg.model["norm"] = "none"
+    model = mmgcn.Model(cfg, {"input_dim": 10, "num_nodes": 8, "text_dim": 4, "visual_dim": 6})
+
+    assert isinstance(model.v_branch.norms[0], nn.Identity)
+    assert isinstance(model.t_branch.norms[0], nn.Identity)
+
+
+def test_inference_mode_validation_accepts_supported_modes() -> None:
+    cfg = _CfgNode(task=_CfgNode(inference_mode="full"))
+    assert resolve_inference_mode(cfg) == "full"
+
+    cfg.task["inference_mode"] = "layerwise"
+    assert resolve_inference_mode(cfg) == "layerwise"
+
+
+def test_inference_mode_validation_rejects_invalid_mode() -> None:
+    cfg = _CfgNode(task=_CfgNode(inference_mode="sampled"))
+
+    with pytest.raises(ValueError, match="task.inference_mode"):
+        resolve_inference_mode(cfg)

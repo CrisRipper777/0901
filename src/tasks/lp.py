@@ -12,6 +12,7 @@ from src.data import EdgeSplit, MAGData
 from src.data.graph_utils import edge_dict_to_index
 from src.models import LinkPredictor, build_model
 from src.tasks.common import clone_state_dict, load_state_dict_cpu
+from src.tasks.inference import infer_all_embeddings, resolve_inference_mode
 from src.utils.metrics import format_pct
 from src.utils.seeds import set_seed
 from src.utils.summary import count_parameters, mean_std
@@ -165,13 +166,6 @@ def _build_edge_loader(cfg, edge_label_index: torch.Tensor, edge_label: torch.Te
     )
 
 
-@torch.no_grad()
-def _infer_all(model, data: MAGData, device: torch.device, uses_graph: bool, batch_size: int) -> torch.Tensor:
-    model.eval()
-    edge_index = data.edge_index if uses_graph else None
-    return model.inference(data.x, edge_index, device=device, batch_size=batch_size)
-
-
 def _prepare_eval_embeddings(
     z: torch.Tensor,
     device: torch.device,
@@ -245,6 +239,7 @@ def _evaluate_split(
 def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Logger, run_id: int) -> dict[str, float]:
     seed = int(cfg.seed) + run_id
     set_seed(seed)
+    inference_mode = resolve_inference_mode(cfg)
     data_info = {
         "input_dim": data.input_dim,
         "num_nodes": data.num_nodes,
@@ -280,6 +275,7 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
         count_parameters(model) + count_parameters(predictor),
     )
     logger.info("Loader: %s", loader_name)
+    logger.info("Inference mode: %s", inference_mode)
     logger.info("Train negative sampling: global filtered | num_neg=%d", int(cfg.task.num_train_neg))
     logger.info("Training...")
 
@@ -347,7 +343,7 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
             logger.info("Epoch %05d | Train Loss %.4f", epoch, train_loss)
             continue
 
-        z = _infer_all(model, data, device, uses_graph, inference_batch_size)
+        z = infer_all_embeddings(model, data, device, uses_graph, inference_batch_size, inference_mode)
         z_eval = _prepare_eval_embeddings(z, device, eval_preload_node_emb, logger)
         val_metrics = _evaluate_split(z_eval, predictor, data.edge_split.valid, device, int(cfg.task.eval_edge_batch_size))
         logger.info("Epoch %05d | Train Loss %.4f", epoch, train_loss)
@@ -384,7 +380,7 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
     if best_model_state is not None and best_predictor_state is not None:
         load_state_dict_cpu(model, best_model_state)
         load_state_dict_cpu(predictor, best_predictor_state)
-        z = _infer_all(model, data, device, uses_graph, inference_batch_size)
+        z = infer_all_embeddings(model, data, device, uses_graph, inference_batch_size, inference_mode)
         z_eval = _prepare_eval_embeddings(z, device, eval_preload_node_emb, logger)
         test_metrics = _evaluate_split(
             z_eval,
@@ -399,7 +395,7 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
         best_test["test_hits@10"] = test_metrics["hits@10"]
 
     if not best_test:
-        z = _infer_all(model, data, device, uses_graph, inference_batch_size)
+        z = infer_all_embeddings(model, data, device, uses_graph, inference_batch_size, inference_mode)
         z_eval = _prepare_eval_embeddings(z, device, eval_preload_node_emb, logger)
         val_metrics = _evaluate_split(z_eval, predictor, data.edge_split.valid, device, int(cfg.task.eval_edge_batch_size))
         test_metrics = _evaluate_split(z_eval, predictor, data.edge_split.test, device, int(cfg.task.eval_edge_batch_size))

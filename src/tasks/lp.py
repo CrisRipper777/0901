@@ -337,6 +337,8 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
             optimizer.step()
             total_loss += float(loss.item()) * int(labels.numel())
             total_examples += int(labels.numel())
+            if hasattr(model, "_batch_n_id"):
+                model._batch_n_id = None
 
         train_loss = total_loss / max(total_examples, 1)
         if epoch % int(cfg.task.eval_every) != 0:
@@ -393,6 +395,8 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
         best_test["test_hits@1"] = test_metrics["hits@1"]
         best_test["test_hits@3"] = test_metrics["hits@3"]
         best_test["test_hits@10"] = test_metrics["hits@10"]
+        del z_eval
+        del z
 
     if not best_test:
         z = infer_all_embeddings(model, data, device, uses_graph, inference_batch_size, inference_mode)
@@ -406,6 +410,11 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
             "test_hits@3": test_metrics["hits@3"],
             "test_hits@10": test_metrics["hits@10"],
         }
+        del z_eval
+        del z
+
+    if hasattr(model, "_batch_n_id"):
+        model._batch_n_id = None
 
     logger.info(
         "[Run %d] Best Val MRR %.2f",

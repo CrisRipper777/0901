@@ -136,6 +136,8 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
             optimizer.step()
             total_loss += float(loss.item()) * int(labels.numel())
             total_examples += int(labels.numel())
+            if hasattr(model, "_batch_n_id"):
+                model._batch_n_id = None
 
         train_loss = total_loss / max(total_examples, 1)
         if epoch % int(cfg.task.eval_every) != 0:
@@ -151,6 +153,7 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
             format_pct(val_metrics["macro_f1"]),
         )
 
+        stop_early = False
         if val_metrics["acc"] > best_val:
             best_val = val_metrics["acc"]
             best_test = {
@@ -166,7 +169,10 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
             logger.info("Patience %d/%d | Best Val Acc %.2f", patience_used, patience_total, format_pct(best_val))
             if patience_left <= 0:
                 logger.info("Early stopping at epoch %03d", epoch)
-                break
+                stop_early = True
+        del z
+        if stop_early:
+            break
 
     if best_model_state is not None and best_head_state is not None:
         load_state_dict_cpu(model, best_model_state)
@@ -175,6 +181,7 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
         test_metrics = _evaluate_split(classifier, z, data.y, data.test_idx, device, inference_batch_size)
         best_test["test_acc"] = test_metrics["acc"]
         best_test["test_macro_f1"] = test_metrics["macro_f1"]
+        del z
 
     if not best_test:
         z = infer_all_embeddings(model, data, device, uses_graph, inference_batch_size, inference_mode)
@@ -186,6 +193,10 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
             "val_acc": val_metrics["acc"],
             "val_macro_f1": val_metrics["macro_f1"],
         }
+        del z
+
+    if hasattr(model, "_batch_n_id"):
+        model._batch_n_id = None
 
     logger.info(
         "[Run %d] Best Val Acc %.2f",

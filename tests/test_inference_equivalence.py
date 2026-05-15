@@ -142,6 +142,16 @@ def test_mmgcn_uses_global_batch_node_ids_for_id_embeddings() -> None:
     assert torch.equal(model._get_id_emb(n_id.numel()), model.id_embedding[n_id])
 
 
+def test_mmgcn_id_embedding_is_not_registered_parameter() -> None:
+    torch.manual_seed(123)
+    model = mmgcn.Model(_cfg(), {"input_dim": 10, "num_nodes": 8, "text_dim": 4, "visual_dim": 6})
+
+    assert isinstance(model.id_embedding, torch.Tensor)
+    assert not isinstance(model.id_embedding, nn.Parameter)
+    assert model.id_embedding.requires_grad
+    assert "id_embedding" not in dict(model.named_parameters())
+
+
 def test_mmgcn_honors_dropout_config() -> None:
     cfg = _cfg()
     cfg.model["dropout"] = 0.37

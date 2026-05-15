@@ -132,8 +132,11 @@ class Model(nn.Module):
                 f"text_dim+visual_dim={self.text_dim + self.visual_dim} exceeds input_dim={input_dim}"
             )
 
-        self.id_embedding = nn.Parameter(
-            nn.init.xavier_normal_(torch.empty(num_nodes, hidden_dim))
+        # Match the reference MMGCN implementations: this looks learnable
+        # (`requires_grad=True`) but is intentionally not an nn.Parameter, so it
+        # is absent from model.parameters() and is not updated by Adam.
+        self.id_embedding = nn.init.xavier_normal_(
+            torch.empty(num_nodes, hidden_dim, requires_grad=True)
         )
         self._batch_n_id: torch.Tensor | None = None
 
@@ -160,6 +163,13 @@ class Model(nn.Module):
         )
 
         self.out_dim = hidden_dim
+
+    def _apply(self, fn):
+        super()._apply(fn)
+        with torch.no_grad():
+            self.id_embedding = fn(self.id_embedding)
+        self.id_embedding.requires_grad_(True)
+        return self
 
     def _get_id_emb(self, num_nodes: int) -> torch.Tensor:
         n_id = getattr(self, "_batch_n_id", None)

@@ -11,7 +11,7 @@ from torch_geometric.loader import LinkNeighborLoader
 from src.data import EdgeSplit, MAGData
 from src.data.graph_utils import edge_dict_to_index
 from src.models import LinkPredictor, build_model
-from src.tasks.common import clone_state_dict, load_state_dict_cpu
+from src.tasks.common import clone_state_dict, load_state_dict_cpu, resolve_num_neighbors
 from src.tasks.inference import infer_all_embeddings, resolve_inference_mode
 from src.utils.metrics import format_pct
 from src.utils.seeds import set_seed
@@ -150,7 +150,7 @@ def _build_link_loader(
     pyg_data = Data(x=data.x, edge_index=data.edge_index)
     return LinkNeighborLoader(
         pyg_data,
-        num_neighbors=[int(v) for v in cfg.task.num_neighbors],
+        num_neighbors=resolve_num_neighbors(cfg),
         batch_size=int(cfg.task.batch_size),
         shuffle=True,
         edge_label_index=edge_label_index,
@@ -275,6 +275,8 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
         count_parameters(model) + count_parameters(predictor),
     )
     logger.info("Loader: %s", loader_name)
+    if uses_graph:
+        logger.info("Train neighbor sampling: %s", resolve_num_neighbors(cfg))
     logger.info("Inference mode: %s", inference_mode)
     logger.info("Train negative sampling: global filtered | num_neg=%d", int(cfg.task.num_train_neg))
     logger.info("Training...")

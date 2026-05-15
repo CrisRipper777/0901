@@ -11,7 +11,7 @@ from sklearn.metrics import f1_score
 
 from src.data import MAGData
 from src.models import build_model
-from src.tasks.common import clone_state_dict, load_state_dict_cpu
+from src.tasks.common import clone_state_dict, load_state_dict_cpu, resolve_num_neighbors
 from src.tasks.inference import infer_all_embeddings, resolve_inference_mode
 from src.utils.metrics import format_pct
 from src.utils.seeds import set_seed
@@ -71,10 +71,11 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
 
     if uses_graph:
         pyg_data = Data(x=data.x, edge_index=data.edge_index, y=data.y)
+        num_neighbors = resolve_num_neighbors(cfg)
         loader = NeighborLoader(
             pyg_data,
             input_nodes=data.train_idx,
-            num_neighbors=[int(v) for v in cfg.task.num_neighbors],
+            num_neighbors=num_neighbors,
             batch_size=int(cfg.task.batch_size),
             shuffle=True,
         )
@@ -97,6 +98,8 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
         count_parameters(model) + count_parameters(classifier),
     )
     logger.info("Loader: %s", loader_name)
+    if uses_graph:
+        logger.info("Train neighbor sampling: %s", num_neighbors)
     logger.info("Inference mode: %s", inference_mode)
     logger.info("Training...")
 

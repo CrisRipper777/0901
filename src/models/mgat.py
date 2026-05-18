@@ -89,7 +89,7 @@ class GraphGAT(MessagePassing):
         return aggr_out
 
 
-class MGATBranch(nn.Module):
+class MgatBranch(nn.Module):
     def __init__(
         self,
         in_dim: int,
@@ -215,14 +215,14 @@ class Model(nn.Module):
         nn.init.xavier_normal_(self.id_embedding.weight)
         self._batch_n_id: torch.Tensor | None = None
 
-        self.v_branch = MGATBranch(
+        self.v_branch = MgatBranch(
             in_dim=self.visual_dim,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
             latent_dim=256,
             norm=norm,
         )
-        self.t_branch = MGATBranch(
+        self.t_branch = MgatBranch(
             in_dim=self.text_dim,
             hidden_dim=hidden_dim,
             num_layers=num_layers,

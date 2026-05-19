@@ -141,14 +141,21 @@ class Model(nn.Module):
         self.norms = nn.ModuleList(
             [nn.BatchNorm1d(hidden_dim) for _ in range(max(num_layers - 1, 0))]
         )
-        self.domain_decoders = nn.ModuleDict(
-            {
-                "text": DomainSpecificDecoder(hidden_dim, self.text_dim),
-                "image": DomainSpecificDecoder(hidden_dim, self.visual_dim),
-            }
-        )
-        self.spd_decoder = SPDDecoder(hidden_dim)
-        self.mask_token = nn.Parameter(torch.randn(hidden_dim))
+        if self.use_reconstruction_loss:
+            self.domain_decoders = nn.ModuleDict(
+                {
+                    "text": DomainSpecificDecoder(hidden_dim, self.text_dim),
+                    "image": DomainSpecificDecoder(hidden_dim, self.visual_dim),
+                }
+            )
+        else:
+            self.domain_decoders = nn.ModuleDict()
+
+        if self.use_spd_loss and self.lambda_spd > 0.0:
+            self.spd_decoder = SPDDecoder(hidden_dim)
+
+        if self.feat_drop_rate > 0.0:
+            self.mask_token = nn.Parameter(torch.randn(hidden_dim))
         self.dropout = nn.Dropout(dropout)
 
     def _split_features(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -157,7 +164,7 @@ class Model(nn.Module):
         return {"text": text_feat, "image": visual_feat}
 
     def _fuse_features(self, features: dict[str, torch.Tensor]) -> torch.Tensor:
-        projected = [self.projectors[name](feat) for name, feat in features.items()]
+        projected = [F.normalize(self.projectors[name](feat), dim=-1) for name, feat in features.items()]
         return torch.stack(projected, dim=0).mean(dim=0)
 
     def _mask_features(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

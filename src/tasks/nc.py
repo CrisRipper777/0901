@@ -136,6 +136,9 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
                 logits = classifier(z)
             loss = criterion(logits, labels) + float(cfg.task.loss.aux_weight) * aux_loss
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(model.parameters()) + list(classifier.parameters()), max_norm=1.0
+            )
             optimizer.step()
             total_loss += float(loss.item()) * int(labels.numel())
             total_examples += int(labels.numel())

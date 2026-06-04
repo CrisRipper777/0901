@@ -6,12 +6,17 @@ weight_decay: 1e-5
 batch_size: 2048
 num_neighbors: 5
 num_train_neg: 1
+
 inference_mode: full # 'full' or 'layerwise'
 inference_batch_size: 4096
 eval_preload_node_emb: true
 eval_every: 1
 patience: 20
-max_train_batches: null
+# 限制每个 epoch 实际训练多少个 mini-batch，null 表示不限制
+max_train_batches: null 
+# null = use all positives; int = sample this many per epoch
+# 限制每个 epoch 一开始采样多少条训练正边
+train_pos_per_epoch: null  
 eval_edge_batch_size: 2048
 
 loss:

@@ -95,13 +95,17 @@ def _sample_filtered_negative_targets(
 
 
 def _build_epoch_train_labels(
-    edge_split: EdgeSplit,
+    train_pos_edge_index: torch.Tensor,
     num_nodes: int,
     num_neg: int,
     forbidden_keys: torch.Tensor,
     generator: torch.Generator,
+    train_pos_per_epoch: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    pos_edge_index = edge_dict_to_index(edge_split.train).cpu()
+    pos_edge_index = train_pos_edge_index
+    if train_pos_per_epoch is not None and train_pos_per_epoch < pos_edge_index.size(1):
+        perm = torch.randperm(pos_edge_index.size(1), generator=generator)[:train_pos_per_epoch]
+        pos_edge_index = pos_edge_index[:, perm]
     pos_src = pos_edge_index[0]
     neg_dst = _sample_filtered_negative_targets(pos_src, num_nodes, num_neg, forbidden_keys, generator)
     neg_edge_index = torch.stack(
@@ -274,11 +278,16 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
         seed,
         count_parameters(model) + count_parameters(predictor),
     )
+    train_pos_per_epoch = cfg.task.get("train_pos_per_epoch")
+    if train_pos_per_epoch is not None:
+        train_pos_per_epoch = int(train_pos_per_epoch)
     logger.info("Loader: %s", loader_name)
     if uses_graph:
         logger.info("Train neighbor sampling: %s", resolve_num_neighbors(cfg))
     logger.info("Inference mode: %s", inference_mode)
     logger.info("Train negative sampling: global filtered | num_neg=%d", int(cfg.task.num_train_neg))
+    if train_pos_per_epoch is not None:
+        logger.info("Train pos per epoch: %d", train_pos_per_epoch)
     logger.info("Training...")
 
     best_val = -1.0
@@ -291,6 +300,7 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
     inference_batch_size = int(cfg.task.inference_batch_size)
     eval_preload_node_emb = bool(cfg.task.get("eval_preload_node_emb", False))
     logger.info("LP eval preload node embeddings: %s", eval_preload_node_emb)
+    train_pos_edge_index_all = edge_dict_to_index(data.edge_split.train).cpu()
 
     for epoch in range(1, int(cfg.task.epochs) + 1):
         model.train()
@@ -298,11 +308,12 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
         total_loss = 0.0
         total_examples = 0
         edge_label_index, edge_label = _build_epoch_train_labels(
-            data.edge_split,
+            train_pos_edge_index_all,
             data.num_nodes,
             int(cfg.task.num_train_neg),
             forbidden_keys,
             neg_generator,
+            train_pos_per_epoch=train_pos_per_epoch,
         )
         if uses_graph:
             loader = _build_link_loader(cfg, data, edge_label_index, edge_label)
@@ -381,6 +392,7 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
 
         del z_eval
         del z
+        torch.cuda.empty_cache()
         if stop_early:
             break
 

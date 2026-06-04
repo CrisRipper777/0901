@@ -177,6 +177,7 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
                 logger.info("Early stopping at epoch %03d", epoch)
                 stop_early = True
         del z
+        torch.cuda.empty_cache()
         if stop_early:
             break
 

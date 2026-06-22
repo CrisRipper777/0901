@@ -11,7 +11,14 @@ from torch_geometric.loader import LinkNeighborLoader
 from src.data import EdgeSplit, MAGData
 from src.data.graph_utils import edge_dict_to_index
 from src.models import LinkPredictor, build_model
-from src.tasks.common import clone_state_dict, load_state_dict_cpu, resolve_num_neighbors
+from src.tasks.common import (
+    clone_state_dict,
+    format_aux_info_stats,
+    load_state_dict_cpu,
+    resolve_num_neighbors,
+    summarize_aux_info_stats,
+    update_aux_info_stats,
+)
 from src.tasks.inference import infer_all_embeddings, resolve_inference_mode
 from src.utils.metrics import format_pct
 from src.utils.seeds import set_seed
@@ -20,6 +27,12 @@ from src.utils.summary import count_parameters, mean_std
 
 def _uses_graph_encoder(cfg) -> bool:
     return str(cfg.model.name).lower() != "mlp"
+
+
+def _uses_full_graph_training(model, cfg) -> bool:
+    if "full_graph_training" in cfg.model:
+        return bool(cfg.model.full_graph_training)
+    return bool(getattr(model, "requires_full_graph_training", False))
 
 
 def _edge_keys(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
@@ -95,14 +108,18 @@ def _sample_filtered_negative_targets(
 
 
 def _build_epoch_train_labels(
-    train_pos_edge_index: torch.Tensor,
+    train_pos_edge_index: torch.Tensor | EdgeSplit,
     num_nodes: int,
     num_neg: int,
     forbidden_keys: torch.Tensor,
     generator: torch.Generator,
     train_pos_per_epoch: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    pos_edge_index = train_pos_edge_index
+    pos_edge_index = (
+        edge_dict_to_index(train_pos_edge_index.train).cpu()
+        if isinstance(train_pos_edge_index, EdgeSplit)
+        else train_pos_edge_index
+    )
     if train_pos_per_epoch is not None and train_pos_per_epoch < pos_edge_index.size(1):
         perm = torch.randperm(pos_edge_index.size(1), generator=generator)[:train_pos_per_epoch]
         pos_edge_index = pos_edge_index[:, perm]
@@ -265,8 +282,13 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
     )
     criterion = torch.nn.BCEWithLogitsLoss()
     uses_graph = _uses_graph_encoder(cfg)
-    loader_name = "LinkNeighborLoader" if uses_graph else "EdgeLabelDataLoader"
-    x_all = data.x.to(device) if not uses_graph else None
+    full_graph_training = uses_graph and _uses_full_graph_training(model, cfg)
+    if full_graph_training:
+        loader_name = "FullGraphEdgeLabelDataLoader"
+    else:
+        loader_name = "LinkNeighborLoader" if uses_graph else "EdgeLabelDataLoader"
+    x_all = data.x.to(device) if (not uses_graph or full_graph_training) else None
+    edge_index_all = data.edge_index.to(device) if full_graph_training else None
     undirected_filter = bool(data.edge_split.metadata.get("undirected", cfg.dataset.get("make_undirected", True)))
     forbidden_keys = _build_forbidden_edge_keys(data.edge_split, data.num_nodes, undirected=undirected_filter)
     neg_generator = torch.Generator().manual_seed(seed)
@@ -282,7 +304,10 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
     if train_pos_per_epoch is not None:
         train_pos_per_epoch = int(train_pos_per_epoch)
     logger.info("Loader: %s", loader_name)
-    if uses_graph:
+    if full_graph_training:
+        logger.info("Train full graph: enabled for global pseudo-node pathways")
+        logger.info("Train edge label batches still exclude current positive labels from the full message graph")
+    elif uses_graph:
         logger.info("Train neighbor sampling: %s", resolve_num_neighbors(cfg))
     logger.info("Inference mode: %s", inference_mode)
     logger.info("Train negative sampling: global filtered | num_neg=%d", int(cfg.task.num_train_neg))
@@ -304,9 +329,13 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
 
     for epoch in range(1, int(cfg.task.epochs) + 1):
         model.train()
+        if hasattr(model, "set_epoch"):
+            model.set_epoch(epoch)
         predictor.train()
         total_loss = 0.0
         total_examples = 0
+        aux_sums: dict[str, float] = {}
+        aux_counts: dict[str, float] = {}
         edge_label_index, edge_label = _build_epoch_train_labels(
             train_pos_edge_index_all,
             data.num_nodes,
@@ -315,7 +344,9 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
             neg_generator,
             train_pos_per_epoch=train_pos_per_epoch,
         )
-        if uses_graph:
+        if full_graph_training:
+            loader = _build_edge_loader(cfg, edge_label_index, edge_label)
+        elif uses_graph:
             loader = _build_link_loader(cfg, data, edge_label_index, edge_label)
         else:
             loader = _build_edge_loader(cfg, edge_label_index, edge_label)
@@ -324,7 +355,20 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
             if max_train_batches is not None and step >= int(max_train_batches):
                 break
             optimizer.zero_grad(set_to_none=True)
-            if uses_graph:
+            if full_graph_training:
+                edges, labels = batch
+                edge_label_index_batch = edges.t().contiguous().to(device)
+                labels = labels.to(device)
+                message_edge_index = _exclude_positive_label_edges_from_message_graph(
+                    edge_index_all,
+                    edge_label_index_batch,
+                    labels,
+                    num_nodes=int(data.num_nodes),
+                )
+                z, _, _, aux_loss, aux_info = model(x_all, message_edge_index)
+                src, dst = edge_label_index_batch
+                logits = predictor.score_pairs(z[src], z[dst])
+            elif uses_graph:
                 batch = batch.to(device)
                 if hasattr(model, "_batch_n_id"):
                     model._batch_n_id = batch.n_id
@@ -334,7 +378,7 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
                     batch.edge_label,
                     num_nodes=int(batch.x.size(0)),
                 )
-                z, _, _, aux_loss, _ = model(batch.x, message_edge_index)
+                z, _, _, aux_loss, aux_info = model(batch.x, message_edge_index)
                 src, dst = batch.edge_label_index
                 logits = predictor.score_pairs(z[src], z[dst])
                 labels = batch.edge_label.float()
@@ -342,7 +386,7 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
                 edges, labels = batch
                 edges = edges.to(device)
                 labels = labels.to(device)
-                z_all, _, _, aux_loss, _ = model(x_all[edges.reshape(-1)], None)
+                z_all, _, _, aux_loss, aux_info = model(x_all[edges.reshape(-1)], None)
                 z_pairs = z_all.view(edges.size(0), 2, -1)
                 logits = predictor.score_pairs(z_pairs[:, 0], z_pairs[:, 1])
             loss = criterion(logits, labels) + float(cfg.task.loss.aux_weight) * aux_loss
@@ -353,18 +397,24 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
             optimizer.step()
             total_loss += float(loss.item()) * int(labels.numel())
             total_examples += int(labels.numel())
+            update_aux_info_stats(aux_sums, aux_counts, aux_info, weight=float(labels.numel()))
             if hasattr(model, "_batch_n_id"):
                 model._batch_n_id = None
 
         train_loss = total_loss / max(total_examples, 1)
+        aux_stats = summarize_aux_info_stats(aux_sums, aux_counts)
         if epoch % int(cfg.task.eval_every) != 0:
             logger.info("Epoch %05d | Train Loss %.4f", epoch, train_loss)
+            if aux_stats:
+                logger.info("Aux %s", format_aux_info_stats(aux_stats))
             continue
 
         z = infer_all_embeddings(model, data, device, uses_graph, inference_batch_size, inference_mode)
         z_eval = _prepare_eval_embeddings(z, device, eval_preload_node_emb, logger)
         val_metrics = _evaluate_split(z_eval, predictor, data.edge_split.valid, device, int(cfg.task.eval_edge_batch_size))
         logger.info("Epoch %05d | Train Loss %.4f", epoch, train_loss)
+        if aux_stats:
+            logger.info("Aux %s", format_aux_info_stats(aux_stats))
         logger.info(
             "Val MRR %.2f | Val H@1 %.2f | Val H@3 %.2f | Val H@10 %.2f",
             format_pct(val_metrics["mrr"]),

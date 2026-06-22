@@ -5,7 +5,7 @@ import torch.nn as nn
 import pytest
 
 from src.data import MAGData
-from src.models import gcn, mlp, mmgcn, sage
+from src.models import dip, gcn, mlp, mmgcn, sage
 from src.tasks.inference import infer_all_embeddings, resolve_inference_mode
 
 
@@ -127,6 +127,32 @@ def test_mmgcn_layerwise_inference_matches_full_batch_forward() -> None:
 
     full, inferred, max_abs_diff = _compare_full_and_inference(model, x, edge_index)
 
+    assert inferred.shape == full.shape
+    assert max_abs_diff < 1e-4
+
+
+def test_dip_layerwise_inference_matches_full_batch_forward() -> None:
+    _, edge_index = _small_graph()
+    x = torch.arange(60, dtype=torch.float32).view(6, 10) / 10.0
+    cfg = _cfg()
+    cfg.model["d_model"] = 4
+    cfg.model["q_dim"] = 4
+    cfg.model["n_q"] = 2
+    cfg.model["mp_hops"] = 2
+    cfg.model["n_pnode_v"] = 3
+    cfg.model["n_pnode_t"] = 2
+    cfg.model["dropout"] = 0.0
+    cfg.model["norm"] = True
+    cfg.model["fusion_type"] = "path_integral"
+    cfg.model["embedding_dim"] = None
+
+    torch.manual_seed(123)
+    model = dip.Model(cfg, {"input_dim": 10, "text_dim": 4, "visual_dim": 6})
+    model.eval()
+
+    full, inferred, max_abs_diff = _compare_full_and_inference(model, x, edge_index)
+
+    assert full.shape == (6, 8)
     assert inferred.shape == full.shape
     assert max_abs_diff < 1e-4
 

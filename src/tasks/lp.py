@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader as TorchDataLoader
 from torch.utils.data import TensorDataset
 from torch_geometric.data import Data
@@ -164,16 +166,18 @@ def _exclude_positive_label_edges_from_message_graph(
 
 def _build_link_loader(
     cfg,
-    data: MAGData,
+    pyg_data: Data,
     edge_label_index: torch.Tensor,
     edge_label: torch.Tensor,
 ) -> LinkNeighborLoader:
-    pyg_data = Data(x=data.x, edge_index=data.edge_index)
     return LinkNeighborLoader(
         pyg_data,
         num_neighbors=resolve_num_neighbors(cfg),
         batch_size=int(cfg.task.batch_size),
         shuffle=True,
+        subgraph_type=str(cfg.task.get("subgraph_type", "bidirectional")),
+        num_workers=int(cfg.task.get("loader_num_workers", 4)),
+        prefetch_factor=int(cfg.task.get("loader_prefetch_factor", 2)),
         edge_label_index=edge_label_index,
         edge_label=edge_label,
     )
@@ -239,9 +243,8 @@ def _evaluate_split(
 
         pos_score = predictor.score_pairs(pos_src, pos_dst)
         neg_score = predictor.score_pairs(neg_src, neg_dst).view(neg.size(0), neg.size(1))
-        greater = (neg_score > pos_score.view(-1, 1)).sum(dim=1).float()
-        equal = (neg_score == pos_score.view(-1, 1)).sum(dim=1).float()
-        ranks = 1.0 + greater + 0.5 * equal
+        # RPTA/OpenMAG pessimistic ranking: ties rank BEHIND the positive.
+        ranks = 1.0 + (neg_score >= pos_score.view(-1, 1)).sum(dim=1).float()
 
         mrr_sum += float((1.0 / ranks).sum().item())
         hits1_sum += float((ranks <= 1).float().sum().item())
@@ -275,11 +278,29 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
         num_layers=int(cfg.task.decoder.num_layers),
         dropout=float(cfg.task.decoder.dropout),
     ).to(device)
-    optimizer = torch.optim.Adam(
-        list(model.parameters()) + list(predictor.parameters()),
-        lr=float(cfg.task.lr),
-        weight_decay=float(cfg.task.weight_decay),
-    )
+    # RPTA-style shared embedding dimension: project every encoder output to a
+    # common dim so the predictor sees identical capacity across models.
+    proj_dim = int(cfg.task.decoder.get("proj_dim", 0) or 0)
+    projection = nn.Linear(model.out_dim, proj_dim).to(device) if proj_dim > 0 else None
+    if projection is not None:
+        predictor = LinkPredictor(
+            in_dim=proj_dim,
+            hidden_dim=int(cfg.task.decoder.hidden_dim),
+            num_layers=int(cfg.task.decoder.num_layers),
+            dropout=float(cfg.task.decoder.dropout),
+        ).to(device)
+    optimizer_name = str(cfg.task.get("optimizer", "adam")).strip().lower()
+    lr = float(cfg.model.get("lr", cfg.task.lr))
+    weight_decay = float(cfg.model.get("weight_decay", cfg.task.weight_decay))
+    optimizer_params = list(model.parameters()) + list(predictor.parameters())
+    if projection is not None:
+        optimizer_params += list(projection.parameters())
+    if optimizer_name == "adam":
+        optimizer = torch.optim.Adam(optimizer_params, lr=lr, weight_decay=weight_decay)
+    elif optimizer_name == "adamw":
+        optimizer = torch.optim.AdamW(optimizer_params, lr=lr, weight_decay=weight_decay)
+    else:
+        raise ValueError(f"task.optimizer must be adam|adamw, got {optimizer_name!r}")
     criterion = torch.nn.BCEWithLogitsLoss()
     uses_graph = _uses_graph_encoder(cfg)
     full_graph_training = uses_graph and _uses_full_graph_training(model, cfg)
@@ -315,12 +336,22 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
         logger.info("Train pos per epoch: %d", train_pos_per_epoch)
     logger.info("Training...")
 
+    # v7-style data-pipeline optimization (RPTA LP_SPEED_OPTIMIZATION.md):
+    # build the feature/edge Data object ONCE and reuse it across epochs —
+    # only the per-epoch edge labels change.
+    pyg_data = Data(x=data.x, edge_index=data.edge_index)
+
     best_val = -1.0
     best_test: dict[str, float] = {}
     best_model_state = None
     best_predictor_state = None
-    patience_total = int(cfg.task.patience)
-    patience_left = patience_total
+    best_proj_state = None
+    # patience null = run the full epoch budget (RPTA-style), still checkpoint
+    # the best val MRR along the way.
+    patience_total = cfg.task.get("patience")
+    patience_left = int(patience_total) if patience_total is not None else None
+    early_stop_min_epoch = int(cfg.task.get("early_stop_min_epoch", 1))
+    grad_clip = cfg.task.get("grad_clip")
     max_train_batches = cfg.task.get("max_train_batches")
     inference_batch_size = int(cfg.task.inference_batch_size)
     eval_preload_node_emb = bool(cfg.task.get("eval_preload_node_emb", False))
@@ -347,7 +378,7 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
         if full_graph_training:
             loader = _build_edge_loader(cfg, edge_label_index, edge_label)
         elif uses_graph:
-            loader = _build_link_loader(cfg, data, edge_label_index, edge_label)
+            loader = _build_link_loader(cfg, pyg_data, edge_label_index, edge_label)
         else:
             loader = _build_edge_loader(cfg, edge_label_index, edge_label)
 
@@ -366,6 +397,8 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
                     num_nodes=int(data.num_nodes),
                 )
                 z, _, _, aux_loss, aux_info = model(x_all, message_edge_index)
+                if projection is not None:
+                    z = projection(z)
                 src, dst = edge_label_index_batch
                 logits = predictor.score_pairs(z[src], z[dst])
             elif uses_graph:
@@ -379,6 +412,8 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
                     num_nodes=int(batch.x.size(0)),
                 )
                 z, _, _, aux_loss, aux_info = model(batch.x, message_edge_index)
+                if projection is not None:
+                    z = projection(z)
                 src, dst = batch.edge_label_index
                 logits = predictor.score_pairs(z[src], z[dst])
                 labels = batch.edge_label.float()
@@ -387,13 +422,14 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
                 edges = edges.to(device)
                 labels = labels.to(device)
                 z_all, _, _, aux_loss, aux_info = model(x_all[edges.reshape(-1)], None)
+                if projection is not None:
+                    z_all = projection(z_all)
                 z_pairs = z_all.view(edges.size(0), 2, -1)
                 logits = predictor.score_pairs(z_pairs[:, 0], z_pairs[:, 1])
             loss = criterion(logits, labels) + float(cfg.task.loss.aux_weight) * aux_loss
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(model.parameters()) + list(predictor.parameters()), max_norm=1.0
-            )
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(optimizer_params, max_norm=float(grad_clip))
             optimizer.step()
             total_loss += float(loss.item()) * int(labels.numel())
             total_examples += int(labels.numel())
@@ -410,6 +446,9 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
             continue
 
         z = infer_all_embeddings(model, data, device, uses_graph, inference_batch_size, inference_mode)
+        if projection is not None:
+            with torch.no_grad():
+                z = projection(z.to(device)).detach().cpu()
         z_eval = _prepare_eval_embeddings(z, device, eval_preload_node_emb, logger)
         val_metrics = _evaluate_split(z_eval, predictor, data.edge_split.valid, device, int(cfg.task.eval_edge_batch_size))
         logger.info("Epoch %05d | Train Loss %.4f", epoch, train_loss)
@@ -431,11 +470,12 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
             }
             best_model_state = clone_state_dict(model)
             best_predictor_state = clone_state_dict(predictor)
-            patience_left = patience_total
-        else:
+            best_proj_state = clone_state_dict(projection) if projection is not None else None
+            patience_left = int(patience_total) if patience_total is not None else None
+        elif patience_left is not None and epoch >= early_stop_min_epoch:
             patience_left -= 1
-            patience_used = patience_total - patience_left
-            logger.info("Patience %d/%d | Best Val MRR %.2f", patience_used, patience_total, format_pct(best_val))
+            patience_used = int(patience_total) - patience_left
+            logger.info("Patience %d/%d | Best Val MRR %.2f", patience_used, int(patience_total), format_pct(best_val))
             if patience_left <= 0:
                 logger.info("Early stopping at epoch %03d", epoch)
                 stop_early = True
@@ -449,7 +489,12 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
     if best_model_state is not None and best_predictor_state is not None:
         load_state_dict_cpu(model, best_model_state)
         load_state_dict_cpu(predictor, best_predictor_state)
+        if best_proj_state is not None and projection is not None:
+            load_state_dict_cpu(projection, best_proj_state)
         z = infer_all_embeddings(model, data, device, uses_graph, inference_batch_size, inference_mode)
+        if projection is not None:
+            with torch.no_grad():
+                z = projection(z.to(device)).detach().cpu()
         z_eval = _prepare_eval_embeddings(z, device, eval_preload_node_emb, logger)
         test_metrics = _evaluate_split(
             z_eval,
@@ -467,6 +512,9 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
 
     if not best_test:
         z = infer_all_embeddings(model, data, device, uses_graph, inference_batch_size, inference_mode)
+        if projection is not None:
+            with torch.no_grad():
+                z = projection(z.to(device)).detach().cpu()
         z_eval = _prepare_eval_embeddings(z, device, eval_preload_node_emb, logger)
         val_metrics = _evaluate_split(z_eval, predictor, data.edge_split.valid, device, int(cfg.task.eval_edge_batch_size))
         test_metrics = _evaluate_split(z_eval, predictor, data.edge_split.test, device, int(cfg.task.eval_edge_batch_size))
@@ -482,6 +530,25 @@ def _run_single_lp(cfg, data: MAGData, device: torch.device, logger: logging.Log
 
     if hasattr(model, "_batch_n_id"):
         model._batch_n_id = None
+
+    save_ckpt_path = cfg.task.get("save_ckpt_path")
+    if save_ckpt_path:
+        path = Path(str(save_ckpt_path))
+        if int(cfg.num_runs) > 1:
+            path = path.with_name(f"{path.stem}_run{run_id + 1}{path.suffix}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "task": "lp",
+                "seed": seed,
+                "model_state": clone_state_dict(model),
+                "head_state": clone_state_dict(predictor),
+                "proj_state": clone_state_dict(projection) if projection is not None else None,
+                "data_info": data_info,
+            },
+            path,
+        )
+        logger.info("Saved checkpoint: %s", path)
 
     logger.info(
         "[Run %d] Best Val MRR %.2f",

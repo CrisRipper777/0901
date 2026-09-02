@@ -178,7 +178,7 @@ class MgatBranch(nn.Module):
             out = torch.empty((num_nodes, linear.out_features), dtype=h.dtype, device="cpu")
             for batch in loader:
                 batch = batch.to(device)
-                id_emb = id_embedding(batch.n_id)
+                id_emb = id_embedding[batch.n_id]
                 h_g = F.leaky_relu(conv(batch.x, batch.edge_index, node_degree=batch.node_degree))
                 x_hat = F.leaky_relu(linear(batch.x)) + id_emb
                 z = norm(g_layer(h_g) + x_hat)
@@ -211,8 +211,14 @@ class Model(nn.Module):
                 f"text_dim+visual_dim={self.text_dim + self.visual_dim} exceeds input_dim={input_dim}"
             )
 
-        self.id_embedding = nn.Embedding(num_nodes, hidden_dim)
-        nn.init.xavier_normal_(self.id_embedding.weight)
+        # Match the MMGCN convention in this repo: the per-node ID table looks
+        # learnable but is intentionally NOT registered, so it is absent from
+        # model.parameters() and never updated by Adam. A trainable per-node
+        # table memorizes train nodes on small graphs (observed: val stuck at
+        # majority-class while train loss -> 0).
+        self.id_embedding = nn.init.xavier_normal_(
+            torch.empty(num_nodes, hidden_dim, requires_grad=True)
+        )
         self._batch_n_id: torch.Tensor | None = None
 
         self.v_branch = MgatBranch(
@@ -232,11 +238,18 @@ class Model(nn.Module):
 
         self.out_dim = hidden_dim * num_layers
 
+    def _apply(self, fn):
+        super()._apply(fn)
+        with torch.no_grad():
+            self.id_embedding = fn(self.id_embedding)
+        self.id_embedding.requires_grad_(True)
+        return self
+
     def _get_id_emb(self, num_nodes: int) -> torch.Tensor:
         n_id = getattr(self, "_batch_n_id", None)
         if n_id is not None:
-            return self.id_embedding(n_id)
-        return self.id_embedding.weight[:num_nodes]
+            return self.id_embedding[n_id]
+        return self.id_embedding[:num_nodes]
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor):
         text_feat = x[:, : self.text_dim]

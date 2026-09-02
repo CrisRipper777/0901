@@ -22,3 +22,7 @@ full_graph_training: true
 # null keeps the encoder output as concat([visual_state, text_state]), i.e. 2*q_dim.
 # Set to an integer, e.g. 128, to add the official LP-style output projection.
 embedding_dim: null
+
+# Official preset (RPTA baseline_adaptations.md): lr 1e-3, wd 1e-5.
+lr: 1e-3
+weight_decay: 1e-5

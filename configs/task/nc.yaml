@@ -1,15 +1,31 @@
 name: nc
 
-epochs: 100
-lr: 5e-3
-weight_decay: 1e-5
+# RPTA-style protocol (reference: RPTA docs/experiment_protocol.md):
+# full-graph training — one forward over the complete transductive graph per
+# epoch, CE on train nodes only, val-Accuracy checkpoint, test evaluated once
+# after the checkpoint is frozen.
+training_mode: full_graph # full_graph | sampled (sampled = fallback for huge graphs)
+optimizer: adamw # adamw | adam
+
+epochs: 300
+lr: 1e-3
+weight_decay: 1e-4
+# Models may override lr / weight_decay via their own config (official presets).
+patience: 30
+early_stop_min_epoch: 1
+grad_clip: null # RPTA uses no gradient clipping
+
+# Only used by training_mode=sampled:
 batch_size: 1024
 num_neighbors: 15
-inference_mode: full
+
+inference_mode: full # 'full' or 'layerwise'
 inference_batch_size: 4096
 eval_every: 1
-patience: 20
 max_train_batches: null
+# Optional: save best checkpoint (model+classifier) for offline P0 factor probes.
+# null = do not save (default behavior unchanged).
+save_ckpt_path: null
 
 loss:
   aux_weight: 1.0

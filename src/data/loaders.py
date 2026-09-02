@@ -91,6 +91,22 @@ def _as_index_tensor(value: Any) -> torch.Tensor:
     return torch.as_tensor(value, dtype=torch.long).contiguous()
 
 
+def _apply_feature_norm(feature: torch.Tensor, norm_name: str | None) -> torch.Tensor:
+    """Per-modality feature normalization (RPTA protocol §2: each modality
+    normalized independently, no full-dataset supervised statistics)."""
+    if not norm_name or str(norm_name).lower() in {"none", "null"}:
+        return feature
+    norm_name = str(norm_name).lower()
+    if norm_name == "node_layer_norm":
+        return torch.nn.functional.layer_norm(feature, (feature.size(1),))
+    raise ValueError(f"Unsupported feature_norm: {norm_name}")
+
+
+def _normalize_modality_features(cfg, text_feat: torch.Tensor, image_feat: torch.Tensor):
+    norm_name = cfg.dataset.get("feature_norm")
+    return _apply_feature_norm(text_feat, norm_name), _apply_feature_norm(image_feat, norm_name)
+
+
 def _load_magb(cfg: DictConfig, task_name: str, seed: int) -> MAGData:
     ds = cfg.dataset
     edge_index_raw, labels, num_nodes = _load_dgl_graph(ds.graph_path)
@@ -101,6 +117,7 @@ def _load_magb(cfg: DictConfig, task_name: str, seed: int) -> MAGData:
             f"{ds.name}: feature/node mismatch: image={tuple(image_feat.shape)}, "
             f"text={tuple(text_feat.shape)}, num_nodes={num_nodes}"
         )
+    text_feat, image_feat = _normalize_modality_features(cfg, text_feat, image_feat)
     x = torch.cat([text_feat, image_feat], dim=1).contiguous()
 
     if task_name == "nc":
@@ -182,6 +199,9 @@ def _load_mmgraph(cfg: DictConfig, task_name: str) -> MAGData:
         int(ds.text_dim) if "text_dim" in ds else None,
         int(ds.visual_dim) if "visual_dim" in ds else None,
     )
+    if x_i is not None and x_t is not None:
+        x_t, x_i = _normalize_modality_features(cfg, x_t, x_i)
+        x = torch.cat([x_t, x_i], dim=1).contiguous()
 
     if task_name == "nc":
         edge_pairs = torch.as_tensor(

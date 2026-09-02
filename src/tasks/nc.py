@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -29,10 +30,28 @@ def _uses_graph_encoder(cfg) -> bool:
     return str(cfg.model.name).lower() != "mlp"
 
 
-def _uses_full_graph_training(model, cfg) -> bool:
-    if "full_graph_training" in cfg.model:
-        return bool(cfg.model.full_graph_training)
-    return bool(getattr(model, "requires_full_graph_training", False))
+def _resolve_training_mode(cfg, model) -> str:
+    """RPTA-style protocol: full-graph training by default (one forward on the
+    complete transductive graph per epoch, CE on train nodes only). ``sampled``
+    is an opt-out fallback for graphs too large for a full-graph forward."""
+    if getattr(model, "requires_full_graph_training", False):
+        return "full_graph"
+    mode = str(cfg.task.get("training_mode", "full_graph")).strip().lower()
+    if mode not in ("full_graph", "sampled"):
+        raise ValueError(f"task.training_mode must be full_graph|sampled, got {mode!r}")
+    return mode
+
+
+def _build_optimizer(parameters, cfg) -> torch.optim.Optimizer:
+    name = str(cfg.task.get("optimizer", "adamw")).strip().lower()
+    # Official per-model presets may override the task-level lr / weight_decay.
+    lr = float(cfg.model.get("lr", cfg.task.lr))
+    weight_decay = float(cfg.model.get("weight_decay", cfg.task.weight_decay))
+    if name == "adamw":
+        return torch.optim.AdamW(parameters, lr=lr, weight_decay=weight_decay)
+    if name == "adam":
+        return torch.optim.Adam(parameters, lr=lr, weight_decay=weight_decay)
+    raise ValueError(f"task.optimizer must be adamw|adam, got {name!r}")
 
 
 @torch.no_grad()
@@ -74,18 +93,14 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
     }
     model = build_model(cfg, data_info).to(device)
     classifier = nn.Linear(model.out_dim, int(data.num_classes)).to(device)
-    optimizer = torch.optim.Adam(
-        list(model.parameters()) + list(classifier.parameters()),
-        lr=float(cfg.task.lr),
-        weight_decay=float(cfg.task.weight_decay),
-    )
+    optimizer = _build_optimizer(list(model.parameters()) + list(classifier.parameters()), cfg)
     criterion = nn.CrossEntropyLoss()
     uses_graph = _uses_graph_encoder(cfg)
-    full_graph_training = uses_graph and _uses_full_graph_training(model, cfg)
+    training_mode = _resolve_training_mode(cfg, model)
 
     num_neighbors = None
-    if full_graph_training:
-        loader = None
+    loader = None
+    if training_mode == "full_graph":
         loader_name = "FullGraph"
     elif uses_graph:
         pyg_data = Data(x=data.x, edge_index=data.edge_index, y=data.y)
@@ -105,22 +120,25 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
             shuffle=True,
         )
         loader_name = "NodeDataLoader"
-    x_all = data.x.to(device) if (not uses_graph or full_graph_training) else None
-    y_all = data.y.to(device) if (not uses_graph or full_graph_training) else None
-    edge_index_all = data.edge_index.to(device) if full_graph_training else None
-    train_idx_all = data.train_idx.to(device) if full_graph_training else None
+
+    x_all = data.x.to(device) if (training_mode == "full_graph" or not uses_graph) else None
+    y_all = data.y.to(device) if (training_mode == "full_graph" or not uses_graph) else None
+    edge_index_all = data.edge_index.to(device) if (uses_graph and training_mode == "full_graph") else None
+    train_idx_all = data.train_idx.to(device) if training_mode == "full_graph" else None
+
+    grad_clip = cfg.task.get("grad_clip")
+    early_stop_min_epoch = int(cfg.task.get("early_stop_min_epoch", 1))
+    aux_weight = float(cfg.task.loss.aux_weight)
 
     logger.info(
-        "[Run %d/%d] seed=%d | model params=%d",
+        "[Run %d/%d] seed=%d | model+head params=%d",
         run_id + 1,
         int(cfg.num_runs),
         seed,
         count_parameters(model) + count_parameters(classifier),
     )
-    logger.info("Loader: %s", loader_name)
-    if full_graph_training:
-        logger.info("Train full graph: enabled for global pseudo-node pathways")
-    elif uses_graph:
+    logger.info("Loader: %s | optimizer: %s", loader_name, str(cfg.task.get("optimizer", "adamw")))
+    if training_mode == "sampled" and uses_graph:
         logger.info("Train neighbor sampling: %s", num_neighbors)
     logger.info("Inference mode: %s", inference_mode)
     logger.info("Training...")
@@ -143,16 +161,17 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
         total_examples = 0
         aux_sums: dict[str, float] = {}
         aux_counts: dict[str, float] = {}
-        if full_graph_training:
+        if training_mode == "full_graph":
             optimizer.zero_grad(set_to_none=True)
             z, _, _, aux_loss, aux_info = model(x_all, edge_index_all)
             labels = y_all[train_idx_all]
             logits = classifier(z[train_idx_all])
-            loss = criterion(logits, labels) + float(cfg.task.loss.aux_weight) * aux_loss
+            loss = criterion(logits, labels) + aux_weight * aux_loss
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(model.parameters()) + list(classifier.parameters()), max_norm=1.0
-            )
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    list(model.parameters()) + list(classifier.parameters()), max_norm=float(grad_clip)
+                )
             optimizer.step()
             total_loss += float(loss.item()) * int(labels.numel())
             total_examples += int(labels.numel())
@@ -176,11 +195,12 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
                     labels = y_all[batch_idx]
                     z, _, _, aux_loss, aux_info = model(x_batch, None)
                     logits = classifier(z)
-                loss = criterion(logits, labels) + float(cfg.task.loss.aux_weight) * aux_loss
+                loss = criterion(logits, labels) + aux_weight * aux_loss
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    list(model.parameters()) + list(classifier.parameters()), max_norm=1.0
-                )
+                if grad_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        list(model.parameters()) + list(classifier.parameters()), max_norm=float(grad_clip)
+                    )
                 optimizer.step()
                 total_loss += float(loss.item()) * int(labels.numel())
                 total_examples += int(labels.numel())
@@ -196,7 +216,18 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
                 logger.info("Aux %s", format_aux_info_stats(aux_stats))
             continue
 
-        z = infer_all_embeddings(model, data, device, uses_graph, inference_batch_size, inference_mode)
+        if inference_mode == "full" and training_mode == "full_graph":
+            # The training forward already used the full graph: reuse the
+            # hosted tensors instead of re-hosting a copy for eval.
+            if hasattr(model, "_batch_n_id"):
+                model._batch_n_id = None
+            model.eval()
+            classifier.eval()
+            with torch.no_grad():
+                z, _, _, _, _ = model(x_all, edge_index_all)
+            z = z.detach().cpu()
+        else:
+            z = infer_all_embeddings(model, data, device, uses_graph, inference_batch_size, inference_mode)
         val_metrics = _evaluate_split(classifier, z, data.y, data.val_idx, device, inference_batch_size)
         logger.info("Epoch %05d | Train Loss %.4f", epoch, train_loss)
         if aux_stats:
@@ -217,7 +248,7 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
             best_model_state = clone_state_dict(model)
             best_head_state = clone_state_dict(classifier)
             patience_left = patience_total
-        else:
+        elif epoch >= early_stop_min_epoch:
             patience_left -= 1
             patience_used = patience_total - patience_left
             logger.info("Patience %d/%d | Best Val Acc %.2f", patience_used, patience_total, format_pct(best_val))
@@ -252,6 +283,24 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
 
     if hasattr(model, "_batch_n_id"):
         model._batch_n_id = None
+
+    save_ckpt_path = cfg.task.get("save_ckpt_path")
+    if save_ckpt_path:
+        path = Path(str(save_ckpt_path))
+        if int(cfg.num_runs) > 1:
+            path = path.with_name(f"{path.stem}_run{run_id + 1}{path.suffix}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "task": "nc",
+                "seed": seed,
+                "model_state": clone_state_dict(model),
+                "head_state": clone_state_dict(classifier),
+                "data_info": data_info,
+            },
+            path,
+        )
+        logger.info("Saved checkpoint: %s", path)
 
     logger.info(
         "[Run %d] Best Val Acc %.2f",

@@ -8,6 +8,7 @@ if __package__ is None or __package__ == "":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import hydra
+import torch
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
@@ -53,6 +54,9 @@ def main(cfg: DictConfig) -> None:
     logger.info("Resolved config:\n%s", OmegaConf.to_yaml(cfg, resolve=True))
 
     device = get_device(str(cfg.device))
+    torch_threads = cfg.task.get("torch_threads")
+    if torch_threads is not None:
+        torch.set_num_threads(int(torch_threads))
     logger.info("Device: %s", device)
 
     data = load_mag_data(cfg, str(cfg.task.name), int(cfg.seed))

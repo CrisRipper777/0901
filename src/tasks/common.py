@@ -15,6 +15,17 @@ AUX_INFO_KEYS = (
     "mean_gamma",
     "proto_loss",
     "gate_loss",
+    # P0 biaxis factorizer diagnostics (only emitted by model=biaxis_p0)
+    "p0_common_loss",
+    "p0_orth_loss",
+    "p0_recon_loss",
+    "p0_common_sim",
+    "p0_private_sim",
+    "p0_c_norm",
+    "p0_pt_norm",
+    "p0_pv_norm",
+    "p0_cp_overlap_t",
+    "p0_cp_overlap_v",
 )
 
 

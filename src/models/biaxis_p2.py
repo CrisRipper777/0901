@@ -52,8 +52,8 @@ class Model(P1Model):
 
         p2 = cfg.model.p2
         self.p2_mode = str(p2.mode)
-        assert self.p2_mode in ("null_softmax", "fixed_uot", "adaptive_uot"), (
-            f"p2.mode must be null_softmax|fixed_uot|adaptive_uot, got {self.p2_mode!r}"
+        assert self.p2_mode in ("null_softmax", "fixed_uot", "adaptive_uot", "relation_uot"), (
+            f"p2.mode must be null_softmax|fixed_uot|adaptive_uot|relation_uot, got {self.p2_mode!r}"
         )
 
         # Drop the P1 gate modules (plan §24): they are replaced by the
@@ -70,8 +70,15 @@ class Model(P1Model):
             hidden_dim=int(p2.score_hidden_dim),
             activation=activation,
         )
-        # Per-factor global null thresholds (plan §7), init 0.
-        self.null_score = nn.Parameter(torch.zeros(3))
+        # Per-factor global null thresholds (plan §7); init from config
+        # (review §17a: null_score_init was previously ignored).
+        self.null_score = nn.Parameter(
+            torch.full((3,), float(p2.get("null_score_init", 0.0)))
+        )
+        # Stop-gradient switches (review §17b: now real config knobs; defaults
+        # keep the plan §10/§17 stop-gradients).
+        self.p2_detach_capacity_prior = bool(p2.get("detach_capacity_prior", True))
+        self.p2_detach_relation_confidence = bool(p2.get("detach_relation_confidence", True))
 
         self.p2_epsilon = float(p2.epsilon)
         self.p2_tau_base = float(p2.tau_base)
@@ -106,21 +113,40 @@ class Model(P1Model):
         s_rel = self.transport_scorer(f_block, g_perm)  # [N, F, K]
         s_aug = build_augmented_scores(s_rel, self.null_score)  # [N, F, K+1]
 
-        # --- capacity reference (availability detached, plan §10) ----------
+        # --- capacity reference (detached by default, plan §10; the switch
+        # is a real config knob now — review §17b) --------------------------
         nu = build_reference_capacity(
             availability,
             num_factors,
             null_prior=self.p2_null_prior,
             degree=deg,
+            detach=self.p2_detach_capacity_prior,
         )  # [N, K+1]
 
-        # --- relation specialization confidence (detached, plan §17) -------
-        q = compute_node_relation_confidence(r, edge_index, num_nodes)  # [N]
+        # --- relation specialization confidence (detached by default,
+        # plan §17; switch per review §17b) ---------------------------------
+        q = compute_node_relation_confidence(
+            r, edge_index, num_nodes, detach=self.p2_detach_relation_confidence
+        )  # [N]
 
         # --- plan solver (plan §26) ----------------------------------------
+        graph_theta = self.p2_tau_base / (self.p2_tau_base + self.p2_epsilon)
         if self.p2_mode == "null_softmax":
             gamma = null_augmented_softmax(s_aug, self.p2_epsilon)
             theta = torch.zeros(num_nodes, dtype=f_block.dtype, device=device)
+        elif self.p2_mode == "relation_uot":
+            # relation-capacity-only (review §19): the Local column is NOT
+            # constrained (theta=0 there); only the R1..RK columns follow the
+            # topology capacity reference. Isolates the effect of relation
+            # capacity from the fixed Local/Graph mass prior.
+            theta_col = torch.full(
+                (num_nodes, self.num_relations + 1), graph_theta, dtype=f_block.dtype, device=device
+            )
+            theta_col[:, 0] = 0.0
+            gamma = semi_relaxed_transport(
+                s_aug, nu, self.p2_epsilon, self.p2_tau_base, self.p2_sinkhorn_iters, theta_col
+            )
+            theta = torch.full((num_nodes,), graph_theta, dtype=f_block.dtype, device=device)
         else:
             theta_override = None
             if self.p2_mode == "adaptive_uot":
@@ -135,12 +161,7 @@ class Model(P1Model):
                 theta_override,
             )
             if self.p2_mode == "fixed_uot":
-                theta = torch.full(
-                    (num_nodes,),
-                    self.p2_tau_base / (self.p2_tau_base + self.p2_epsilon),
-                    dtype=f_block.dtype,
-                    device=device,
-                )
+                theta = torch.full((num_nodes,), graph_theta, dtype=f_block.dtype, device=device)
             else:
                 theta = theta_override.squeeze(-1)  # [N]
 
@@ -229,18 +250,30 @@ class Model(P1Model):
         entropy = {name: float(plan_entropy[:, idx].mean().item()) for idx, name in enumerate(factor_names)}
 
         # --- conditional relation selectivity (§30.3, P1-comparable JS) ----
+        # review §16: conditional alpha is only meaningful where graph mass is
+        # non-negligible; report both all-node JS and active-masked JS.
         alpha = graph_out["alpha"]  # [N, F, K]
         log_alpha = torch.log(alpha + self.eps)
         alpha_ent = -(alpha * log_alpha).sum(dim=-1)  # [N, F]
         alpha_entropy = {name: float(alpha_ent[:, idx].mean().item()) for idx, name in enumerate(factor_names)}
         js: dict[str, float] = {}
+        js_active: dict[str, float] = {}
+        active_delta = 0.1
+        active = graph_mass > active_delta  # [N, F]
+        active_frac = {name: float(active[:, idx].float().mean().item()) for idx, name in enumerate(factor_names)}
         for i in range(len(factor_names)):
             for j in range(i + 1, len(factor_names)):
                 p = alpha[:, i] + self.eps
                 qq = alpha[:, j] + self.eps
                 m = 0.5 * (p + qq)
                 js_val = 0.5 * ((p * torch.log(p / m)).sum(dim=-1) + (qq * torch.log(qq / m)).sum(dim=-1))
-                js[f"{factor_names[i]}_{factor_names[j]}"] = float(js_val.mean().item())
+                key = f"{factor_names[i]}_{factor_names[j]}"
+                js[key] = float(js_val.mean().item())
+                mask = active[:, i] & active[:, j]
+                if bool(mask.any()):
+                    js_active[key] = float(js_val[mask].mean().item())
+                else:
+                    js_active[key] = None
 
         # --- column capacity deviation (§30.4) -----------------------------
         col_mass = gamma.sum(dim=1)  # [N, K+1]
@@ -275,6 +308,8 @@ class Model(P1Model):
             "plan_entropy": entropy,
             "alpha_entropy": alpha_entropy,
             "alpha_js": js,
+            "alpha_js_active": js_active,
+            "graph_active_frac": active_frac,
             "capacity_kl": capacity_kl,
             "capacity_l1": capacity_l1,
             "relation_confidence": {

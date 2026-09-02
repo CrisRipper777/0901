@@ -34,10 +34,34 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from run_p1_screen import _parse_train_log, _poll_peak_mem  # noqa: E402
 
+
+def _parse_best_val_f1(log_path: Path) -> float | None:
+    """Val Macro-F1 at the best-val-acc epoch, parsed from the train log
+    (results.json does not carry val F1; log values are 2-decimal rounded)."""
+    if not log_path.exists():
+        return None
+    best_acc, best_f1 = -1.0, None
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        match = re.search(r"Val Acc ([\d.]+) \| Val F1 ([\d.]+)", line)
+        if match:
+            acc = float(match.group(1))
+            if acc > best_acc:
+                best_acc, best_f1 = acc, float(match.group(2))
+    return best_f1
+
 P2_MODES = ["null_softmax", "fixed_uot", "adaptive_uot"]
 NC_DATASETS = ["Movies", "Toys", "Grocery", "ele-fashion", "Reddit-S"]
 SCREEN_SEEDS = [42]
 CONFIRM_SEEDS = [42, 43, 44]
+
+# mode label -> hydra overrides; custom labels are registered via --mode-def
+# (e.g. fixed_pi025=model.p2.mode=fixed_uot,model.p2.null_prior=0.25).
+MODE_OVERRIDES: dict[str, list[str]] = {
+    "null_softmax": ["model.p2.mode=null_softmax"],
+    "fixed_uot": ["model.p2.mode=fixed_uot"],
+    "adaptive_uot": ["model.p2.mode=adaptive_uot"],
+    "relation_uot": ["model.p2.mode=relation_uot"],
+}
 
 
 def _stage_config(stage: str) -> tuple[list[str], list[str], list[int], str]:
@@ -89,7 +113,7 @@ def _run_job_locked(
     no_diagnostics: bool,
     num_seeds: int,
 ) -> None:
-    overrides = [f"model.p2.mode={mode}"]
+    overrides = list(MODE_OVERRIDES[mode])
     outdir = _run_dir(out_root, dataset, mode, seed, num_seeds)
     outdir.mkdir(parents=True, exist_ok=True)
     tag = f"[{gpu_id}] {dataset} {mode} seed={seed}"
@@ -165,6 +189,7 @@ def _run_job_locked(
         "mode": mode,
         "seed": seed,
         "results": results,
+        "best_val_macro_f1": _parse_best_val_f1(train_log),
         "params": log_info["params"],
         "runtime_sec": round(runtime_sec, 1),
         "epoch_time_sec": round(runtime_sec / log_info["epochs_run"], 2) if log_info["epochs_run"] else None,
@@ -189,7 +214,17 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=None, help="smoke only")
     parser.add_argument("--no-diagnostics", action="store_true")
     parser.add_argument("--out-root", default=None, help="override output root (smoke/revise experiments)")
+    parser.add_argument(
+        "--mode-def",
+        action="append",
+        default=[],
+        help="register a custom mode: label=comma,separated,hydra,overrides (repeatable)",
+    )
     args = parser.parse_args()
+
+    for mode_def in args.mode_def:
+        label, _, overrides = mode_def.partition("=")
+        MODE_OVERRIDES[label.strip()] = [o.strip() for o in overrides.split(",") if o.strip()]
 
     datasets_all, modes, seeds, out_root = _stage_config(args.stage)
     if args.out_root:
@@ -199,8 +234,10 @@ def main() -> None:
         requested = [item.strip() for item in args.datasets.split(",") if item.strip()]
         datasets = [d for d in datasets_all if d in requested]
     if args.modes:
-        requested_modes = [item.strip() for item in args.modes.split(",") if item.strip()]
-        modes = [m for m in modes if m in requested_modes]
+        modes = [item.strip() for item in args.modes.split(",") if item.strip()]
+        unknown = [m for m in modes if m not in MODE_OVERRIDES]
+        if unknown:
+            parser.error(f"unknown modes (use --mode-def): {unknown}")
     if args.seeds:
         seeds = [int(seed.strip()) for seed in args.seeds.split(",") if seed.strip()]
     gpus = [int(gpu.strip()) for gpu in args.gpus.split(",") if gpu.strip()]

@@ -105,6 +105,12 @@ def test_capacity_reference_stop_gradient() -> None:
     assert not nu.requires_grad  # plan §10
 
 
+def test_capacity_reference_detach_switch() -> None:
+    a = _rand_availability().requires_grad_(True)
+    nu_no_detach = build_reference_capacity(a, num_factors=F, detach=False)
+    assert nu_no_detach.requires_grad  # review §17b: switch is real now
+
+
 def test_relation_confidence_uniform_r_near_zero() -> None:
     r = torch.full((30, K), 1.0 / K)
     edge_index = torch.randint(0, N, (2, 30))
@@ -139,6 +145,33 @@ def test_relation_confidence_stop_gradient() -> None:
     assert not q.requires_grad  # plan §17
 
 
+def test_relation_confidence_detach_switch() -> None:
+    r = _rand_r().requires_grad_(True)
+    edge_index = torch.randint(0, N, (2, 30))
+    q = compute_node_relation_confidence(r, edge_index, N, detach=False)
+    assert q.requires_grad  # review §17b
+
+
+def test_relation_uot_local_column_unconstrained() -> None:
+    """Per-column theta (review §19): with Local theta=0 the Local column is
+    never updated (v_0 stays 1), so the plan is EXACTLY invariant to the
+    Local reference nu[:,0]; fixed_uot responds to nu[:,0]."""
+    s_aug = build_augmented_scores(_rand_scores(), torch.zeros(F))
+    a = _rand_availability()
+    nu1 = build_reference_capacity(a, num_factors=F, null_prior=0.5)
+    nu2 = nu1.clone()
+    nu2[:, 0] = 0.3  # different Local capacity target
+    theta_col = torch.full((N, K + 1), 1.0 / (1.0 + 0.2))
+    theta_col[:, 0] = 0.0
+    g_rel_1 = semi_relaxed_transport(s_aug, nu1, 0.2, 1.0, 50, theta_col)
+    g_rel_2 = semi_relaxed_transport(s_aug, nu2, 0.2, 1.0, 50, theta_col)
+    g_fix_1 = semi_relaxed_transport(s_aug, nu1, 0.2, 1.0, 50)
+    g_fix_2 = semi_relaxed_transport(s_aug, nu2, 0.2, 1.0, 50)
+    assert torch.allclose(g_rel_1, g_rel_2, atol=1e-6)  # invariant to nu_0
+    assert not torch.allclose(g_fix_1, g_fix_2, atol=1e-4)  # fixed mode responds
+    assert (g_fix_1[..., 0].sum(dim=-1) > g_fix_2[..., 0].sum(dim=-1)).all()  # larger nu_0 -> more Local
+
+
 # ---------------------------------------------------------------------------
 # NullSoftmax
 # ---------------------------------------------------------------------------
@@ -167,7 +200,9 @@ def test_null_score_gradient() -> None:
     s_rel = _rand_scores()
     z = torch.zeros(F, requires_grad=True)
     gamma = null_augmented_softmax(build_augmented_scores(s_rel, z), epsilon=0.2)
-    gamma.sum().backward()
+    # NOT gamma.sum(): each row sums to 1, so the total is a constant with
+    # zero gradient (review §17c). Use the null column slice instead.
+    gamma[..., 0].mean().backward()
     assert z.grad is not None and torch.isfinite(z.grad).all()
     assert z.grad.norm() > 1e-9
 
@@ -533,3 +568,37 @@ def test_p2_null_softmax_theta_zero() -> None:
     f_block = torch.randn(P2_NUM_NODES, 3, P2_FACTOR_DIM)
     out = model._graph_update(f_block, edge_index, P2_NUM_NODES)
     assert torch.equal(out["theta"], torch.zeros(P2_NUM_NODES))
+
+
+def test_p2_relation_uot_mode_forward() -> None:
+    model = _make_p2_model("relation_uot")
+    model.eval()
+    x = _make_p2_x()
+    edge_index = _make_p2_edge_index()
+    z, _, _, _, _ = model(x, edge_index)
+    assert z.shape == (P2_NUM_NODES, P2_HIDDEN_DIM)
+    assert torch.isfinite(z).all()
+    out = model._graph_update(torch.randn(P2_NUM_NODES, 3, P2_FACTOR_DIM), edge_index, P2_NUM_NODES)
+    assert torch.allclose(out["gamma"].sum(dim=-1), torch.ones(P2_NUM_NODES, 3), atol=1e-5)
+    # graph-column theta constant; diagnostics expose the switch via theta.
+    assert torch.allclose(
+        out["theta"], torch.full((P2_NUM_NODES,), 1.0 / 1.2), atol=1e-6
+    )
+
+
+def test_p2_null_score_init_read_from_config() -> None:
+    model = _make_p2_model("null_softmax", null_score_init=1.5)
+    assert torch.equal(model.null_score.data, torch.full((3,), 1.5))  # review §17a
+
+
+def test_p2_diagnostics_js_active() -> None:
+    import json
+
+    model = _make_p2_model("fixed_uot")
+    model.eval()
+    diag = model.compute_p2_diagnostics(_make_p2_x(), _make_p2_edge_index())
+    assert set(diag["alpha_js_active"].keys()) == {"C_Pt", "C_Pv", "Pt_Pv"}
+    for key, value in diag["alpha_js_active"].items():
+        assert value is None or value >= 0
+    assert set(diag["graph_active_frac"].keys()) == {"C", "Pt", "Pv"}
+    json.dumps(diag)  # None values must survive JSON round-trip (null)

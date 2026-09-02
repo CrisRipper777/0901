@@ -37,7 +37,9 @@ p1:
 
 # --- P2 transport coupling (plan §19) ---
 p2:
-  # null_softmax | fixed_uot | adaptive_uot
+  # null_softmax | fixed_uot | adaptive_uot | relation_uot
+  # relation_uot = relation-capacity-only (review §19): Local column NOT
+  # constrained (theta=0 there), only R1..RK follow the topology capacity.
   mode: adaptive_uot
 
   score_hidden_dim: 64

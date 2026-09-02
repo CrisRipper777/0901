@@ -80,17 +80,22 @@ def build_reference_capacity(
     num_factors: int,
     null_prior: float = 0.5,
     degree: torch.Tensor | None = None,
+    detach: bool = True,
 ) -> torch.Tensor:
     """Relation-side reference capacity (plan §9):
 
         nu_i = F * [pi0, (1-pi0)*a_i1, ..., (1-pi0)*a_iK]     [N, K+1]
 
-    availability must be DETACHED by the caller (plan §10 stop-gradient);
-    the function detaches defensively as well.
+    detach=True (default, plan §10 stop-gradient): the capacity prior must
+    not receive gradients from the relation module. detach=False exists only
+    for the explicit config switch (review §17b) — default experiments keep
+    the stop-gradient.
     Isolated nodes get pi0=1 (pure Local reference); they never run the
     transport anyway (fast path).
     """
-    availability = torch.as_tensor(availability).detach()
+    availability = torch.as_tensor(availability)
+    if detach:
+        availability = availability.detach()
     num_nodes, k = availability.shape
     ref = torch.cat(
         [
@@ -111,6 +116,7 @@ def compute_node_relation_confidence(
     r: torch.Tensor,
     edge_index: torch.Tensor,
     num_nodes: int,
+    detach: bool = True,
 ) -> torch.Tensor:
     """Node-wise relation specialization confidence (plan §16):
 
@@ -118,7 +124,8 @@ def compute_node_relation_confidence(
         hbar_i = mean over incoming edges
         q_i = clamp(1 - hbar_i / log(K), 0, 1)
 
-    Isolated nodes: q = 0. ALWAYS detached (plan §17 stop-gradient).
+    Isolated nodes: q = 0. detach=True by default (plan §17 stop-gradient);
+    False only for the explicit config switch (review §17b).
     """
     r = torch.as_tensor(r)
     num_relations = int(r.size(1))
@@ -130,7 +137,9 @@ def compute_node_relation_confidence(
     hbar = acc / (degree + _EPS)
     q = (1.0 - hbar / (torch.log(torch.tensor(float(num_relations), dtype=r.dtype, device=r.device)))).clamp(0.0, 1.0)
     q = torch.where(degree <= 0, torch.zeros_like(q), q)
-    return q.detach()
+    if detach:
+        q = q.detach()
+    return q
 
 
 def null_augmented_softmax(scores: torch.Tensor, epsilon: float) -> torch.Tensor:
@@ -163,6 +172,8 @@ def semi_relaxed_transport(
     - theta_override None -> fixed mode: theta = tau_base/(tau_base+eps) scalar.
     - theta_override [N,1] -> adaptive mode: theta_i = tau_i/(tau_i+eps)
       (tau_i = tau_base * q_i^R, plan §18).
+    - theta_override [N,K+1] -> per-column theta (used by relation_uot:
+      Local column theta=0 removes the Local-capacity constraint, review §19).
     Row constants are removed from S for numerical stability (absorbed by u;
     plan unchanged under hard row marginal).
     """

@@ -21,6 +21,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import statistics
 from pathlib import Path
 
@@ -81,7 +82,12 @@ def _load_summaries(stage: str) -> list[dict]:
 
 
 def _load_p1_f1r1_reference() -> dict[str, dict[str, str]]:
-    """{dataset: {metric: 'mean±std'}} from frozen P1 confirm F1R1 rows."""
+    """{dataset: {metric: 'mean±std'}} from frozen P1 confirm F1R1 rows.
+
+    Val Macro-F1 is not in P1's results.json; parse it from the P1 train
+    logs (Val F1 at the best-val-acc epoch, 2-decimal rounded — same
+    convention as the P2 driver).
+    """
     ref: dict[str, dict[str, str]] = {}
     if not P1_CONFIRM_CSV.exists():
         return ref
@@ -95,6 +101,21 @@ def _load_p1_f1r1_reference() -> dict[str, dict[str, str]]:
         for key, digits in (("best_val_acc", 4), ("test_acc", 4), ("test_macro_f1", 4)):
             values = [float(r[key]) for r in runs if r.get(key)]
             out[key] = _mean_std(values, digits)
+        val_f1s: list[float] = []
+        for run in runs:
+            log = P1_CONFIRM_CSV.parent / run["dataset"] / "F1R1" / f"seed_{run['seed']}" / "train.log"
+            best_acc, best_f1 = -1.0, None
+            if log.exists():
+                for line in log.read_text(encoding="utf-8").splitlines():
+                    match = re.search(r"Val Acc ([\d.]+) \| Val F1 ([\d.]+)", line)
+                    if match:
+                        acc = float(match.group(1))
+                        if acc > best_acc:
+                            best_acc, best_f1 = acc, float(match.group(2))
+            if best_f1 is not None:
+                val_f1s.append(best_f1)
+        if val_f1s:
+            out["best_val_macro_f1"] = _mean_std(val_f1s)
         ref[dataset] = out
     return ref
 
@@ -107,6 +128,7 @@ def _results_rows(summaries: list[dict]) -> list[dict]:
             "mode": s["mode"],
             "seed": s["seed"],
             "best_val_acc": _fmt(_metric(s.get("results"), "val_acc")),
+            "best_val_macro_f1": _fmt(s.get("best_val_macro_f1")),
             "test_acc": _fmt(_metric(s.get("results"), "test_acc")),
             "test_macro_f1": _fmt(_metric(s.get("results"), "test_macro_f1")),
             "params": s.get("params", ""),
@@ -186,6 +208,36 @@ def _write_report(stage: str, summaries: list[dict], ref: dict[str, dict[str, st
             vals = [v for v in vals if v is not None]
             cells.append(_mean_std(vals) if vals else "")
         p1 = ref.get(dataset, {}).get("test_acc", "")
+        lines.append(f"| {dataset} | {p1} | {cells[0]} | {cells[1]} | {cells[2]} |")
+    lines.append("")
+
+    lines.append("Val Macro-F1 (at best-val-acc epoch; P2 parsed from train.log, P1 likewise):")
+    lines.append("")
+    lines.append("| Dataset | P1 F1R1 | NullSoftmax | Fixed-UOT | Adaptive-UOT |")
+    lines.append("|---|" + "---:|" * 4)
+    for dataset in DATASETS:
+        cells = []
+        for mode in MODES:
+            runs = grouped.get((dataset, mode), [])
+            vals = [r.get("best_val_macro_f1") for r in runs]
+            vals = [v for v in vals if v is not None]
+            cells.append(_mean_std(vals) if vals else "")
+        p1 = ref.get(dataset, {}).get("best_val_macro_f1", "")
+        lines.append(f"| {dataset} | {p1} | {cells[0]} | {cells[1]} | {cells[2]} |")
+    lines.append("")
+
+    lines.append("Test Macro-F1 (frozen-checkpoint confirmation):")
+    lines.append("")
+    lines.append("| Dataset | P1 F1R1 | NullSoftmax | Fixed-UOT | Adaptive-UOT |")
+    lines.append("|---|" + "---:|" * 4)
+    for dataset in DATASETS:
+        cells = []
+        for mode in MODES:
+            runs = grouped.get((dataset, mode), [])
+            vals = [_metric(r.get("results"), "test_macro_f1") for r in runs]
+            vals = [v for v in vals if v is not None]
+            cells.append(_mean_std(vals) if vals else "")
+        p1 = ref.get(dataset, {}).get("test_macro_f1", "")
         lines.append(f"| {dataset} | {p1} | {cells[0]} | {cells[1]} | {cells[2]} |")
     lines.append("")
 

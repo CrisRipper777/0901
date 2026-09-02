@@ -30,7 +30,7 @@ P2_ROOT = PROJECT_ROOT / "outputs" / "p2"
 P1_CONFIRM_CSV = PROJECT_ROOT / "outputs" / "p1" / "confirm" / "p1_confirm_results.csv"
 
 DATASETS = ["Movies", "Toys", "Grocery", "ele-fashion", "Reddit-S"]
-MODES = ["null_softmax", "fixed_uot", "adaptive_uot"]
+MODES = ["null_softmax", "fixed_uot", "adaptive_uot", "composition_uot"]
 
 
 def _fmt(value, digits: int = 4) -> str:
@@ -183,9 +183,9 @@ def _write_report(stage: str, summaries: list[dict], ref: dict[str, dict[str, st
 
     lines.append("## Main table (mean±std over seeds)")
     lines.append("")
-    header = "| Dataset | P1 F1R1 | NullSoftmax | Fixed-UOT | Adaptive-UOT |"
+    header = "| Dataset | P1 F1R1 | NullSoftmax | Fixed-UOT | Adaptive-UOT | Composition-UOT |"
     lines.append(header)
-    lines.append("|---|" + "---:|" * 4)
+    lines.append("|---|" + "---:|" * 5)
     for dataset in DATASETS:
         cells = []
         for mode in MODES:
@@ -194,12 +194,12 @@ def _write_report(stage: str, summaries: list[dict], ref: dict[str, dict[str, st
             vals = [v for v in vals if v is not None]
             cells.append(_mean_std(vals) if vals else "")
         p1 = ref.get(dataset, {}).get("best_val_acc", "")
-        lines.append(f"| {dataset} | {p1} | {cells[0]} | {cells[1]} | {cells[2]} |")
+        lines.append(f"| {dataset} | {p1} | " + " | ".join(cells) + " |")
     lines.append("")
     lines.append("Test acc (same order):")
     lines.append("")
-    lines.append("| Dataset | P1 F1R1 | NullSoftmax | Fixed-UOT | Adaptive-UOT |")
-    lines.append("|---|" + "---:|" * 4)
+    lines.append("| Dataset | P1 F1R1 | NullSoftmax | Fixed-UOT | Adaptive-UOT | Composition-UOT |")
+    lines.append("|---|" + "---:|" * 5)
     for dataset in DATASETS:
         cells = []
         for mode in MODES:
@@ -208,13 +208,13 @@ def _write_report(stage: str, summaries: list[dict], ref: dict[str, dict[str, st
             vals = [v for v in vals if v is not None]
             cells.append(_mean_std(vals) if vals else "")
         p1 = ref.get(dataset, {}).get("test_acc", "")
-        lines.append(f"| {dataset} | {p1} | {cells[0]} | {cells[1]} | {cells[2]} |")
+        lines.append(f"| {dataset} | {p1} | " + " | ".join(cells) + " |")
     lines.append("")
 
     lines.append("Val Macro-F1 (at best-val-acc epoch; P2 parsed from train.log, P1 likewise):")
     lines.append("")
-    lines.append("| Dataset | P1 F1R1 | NullSoftmax | Fixed-UOT | Adaptive-UOT |")
-    lines.append("|---|" + "---:|" * 4)
+    lines.append("| Dataset | P1 F1R1 | NullSoftmax | Fixed-UOT | Adaptive-UOT | Composition-UOT |")
+    lines.append("|---|" + "---:|" * 5)
     for dataset in DATASETS:
         cells = []
         for mode in MODES:
@@ -223,13 +223,13 @@ def _write_report(stage: str, summaries: list[dict], ref: dict[str, dict[str, st
             vals = [v for v in vals if v is not None]
             cells.append(_mean_std(vals) if vals else "")
         p1 = ref.get(dataset, {}).get("best_val_macro_f1", "")
-        lines.append(f"| {dataset} | {p1} | {cells[0]} | {cells[1]} | {cells[2]} |")
+        lines.append(f"| {dataset} | {p1} | " + " | ".join(cells) + " |")
     lines.append("")
 
     lines.append("Test Macro-F1 (frozen-checkpoint confirmation):")
     lines.append("")
-    lines.append("| Dataset | P1 F1R1 | NullSoftmax | Fixed-UOT | Adaptive-UOT |")
-    lines.append("|---|" + "---:|" * 4)
+    lines.append("| Dataset | P1 F1R1 | NullSoftmax | Fixed-UOT | Adaptive-UOT | Composition-UOT |")
+    lines.append("|---|" + "---:|" * 5)
     for dataset in DATASETS:
         cells = []
         for mode in MODES:
@@ -238,7 +238,7 @@ def _write_report(stage: str, summaries: list[dict], ref: dict[str, dict[str, st
             vals = [v for v in vals if v is not None]
             cells.append(_mean_std(vals) if vals else "")
         p1 = ref.get(dataset, {}).get("test_macro_f1", "")
-        lines.append(f"| {dataset} | {p1} | {cells[0]} | {cells[1]} | {cells[2]} |")
+        lines.append(f"| {dataset} | {p1} | " + " | ".join(cells) + " |")
     lines.append("")
 
     lines.append("## Mechanism (per run)")

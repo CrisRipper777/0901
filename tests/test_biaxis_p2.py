@@ -155,7 +155,8 @@ def test_relation_confidence_detach_switch() -> None:
 def test_relation_uot_local_column_unconstrained() -> None:
     """Per-column theta (review §19): with Local theta=0 the Local column is
     never updated (v_0 stays 1), so the plan is EXACTLY invariant to the
-    Local reference nu[:,0]; fixed_uot responds to nu[:,0]."""
+    Local reference nu[:,0]; fixed_uot responds to nu[:,0]. (Mechanics test;
+    composition_uot builds on this with the NS-mass graph reference.)"""
     s_aug = build_augmented_scores(_rand_scores(), torch.zeros(F))
     a = _rand_availability()
     nu1 = build_reference_capacity(a, num_factors=F, null_prior=0.5)
@@ -570,8 +571,8 @@ def test_p2_null_softmax_theta_zero() -> None:
     assert torch.equal(out["theta"], torch.zeros(P2_NUM_NODES))
 
 
-def test_p2_relation_uot_mode_forward() -> None:
-    model = _make_p2_model("relation_uot")
+def test_p2_composition_uot_mode_forward() -> None:
+    model = _make_p2_model("composition_uot")
     model.eval()
     x = _make_p2_x()
     edge_index = _make_p2_edge_index()
@@ -602,3 +603,42 @@ def test_p2_diagnostics_js_active() -> None:
         assert value is None or value >= 0
     assert set(diag["graph_active_frac"].keys()) == {"C", "Pt", "Pv"}
     json.dumps(diag)  # None values must survive JSON round-trip (null)
+
+
+def test_p2_composition_uot_preserves_ns_total_graph_mass() -> None:
+    """review §9/§10: composition_uot keeps the total graph mass at the
+    unconstrained NullSoftmax value M_i^NS, while fixed_uot pulls it towards
+    F*(1-pi0). Verified with zero scores (analytic regime)."""
+    import sys
+    sys.path.insert(0, ".")
+
+    from src.models.biaxis_p2_components import (
+        build_augmented_scores,
+        build_reference_capacity,
+        null_augmented_softmax,
+        semi_relaxed_transport,
+    )
+
+    num_nodes, num_factors, k = 7, 3, 4
+    a = torch.rand(num_nodes, k)
+    a = a / a.sum(dim=-1, keepdim=True)
+    s_aug = build_augmented_scores(torch.zeros(num_nodes, num_factors, k), torch.zeros(num_factors))
+    gamma_ns = null_augmented_softmax(s_aug, 0.2)
+    m_ns = gamma_ns[..., 1:].sum(dim=(1, 2)).detach()
+    nu_rel = torch.cat([torch.zeros(num_nodes, 1), m_ns.unsqueeze(-1) * a], dim=-1)
+    theta_col = torch.full((num_nodes, k + 1), 1.0 / 1.2)
+    theta_col[:, 0] = 0.0
+    g_comp = semi_relaxed_transport(s_aug, nu_rel, 0.2, 1.0, 200, theta_col)
+    g_fixed = semi_relaxed_transport(s_aug, build_reference_capacity(a, num_factors=3), 0.2, 1.0, 200)
+    graph_comp = g_comp[..., 1:].sum(dim=(1, 2))
+    graph_fixed = g_fixed[..., 1:].sum(dim=(1, 2))
+    # composition: total graph mass stays at the NS value (~2.4).
+    assert torch.allclose(graph_comp.mean(), torch.tensor(2.4), atol=0.15)
+    # fixed: pulled down towards F*(1-pi0) = 1.5.
+    assert abs(graph_fixed.mean().item() - 1.5) < 0.25
+    assert graph_comp.mean() > graph_fixed.mean()
+
+
+def test_p2_rejects_old_relation_uot_mode() -> None:
+    with pytest.raises(AssertionError):
+        _make_p2_model("relation_uot")

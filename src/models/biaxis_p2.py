@@ -52,8 +52,8 @@ class Model(P1Model):
 
         p2 = cfg.model.p2
         self.p2_mode = str(p2.mode)
-        assert self.p2_mode in ("null_softmax", "fixed_uot", "adaptive_uot", "relation_uot"), (
-            f"p2.mode must be null_softmax|fixed_uot|adaptive_uot|relation_uot, got {self.p2_mode!r}"
+        assert self.p2_mode in ("null_softmax", "fixed_uot", "adaptive_uot", "composition_uot"), (
+            f"p2.mode must be null_softmax|fixed_uot|adaptive_uot|composition_uot, got {self.p2_mode!r}"
         )
 
         # Drop the P1 gate modules (plan §24): they are replaced by the
@@ -134,17 +134,27 @@ class Model(P1Model):
         if self.p2_mode == "null_softmax":
             gamma = null_augmented_softmax(s_aug, self.p2_epsilon)
             theta = torch.zeros(num_nodes, dtype=f_block.dtype, device=device)
-        elif self.p2_mode == "relation_uot":
-            # relation-capacity-only (review §19): the Local column is NOT
-            # constrained (theta=0 there); only the R1..RK columns follow the
-            # topology capacity reference. Isolates the effect of relation
-            # capacity from the fixed Local/Graph mass prior.
+        elif self.p2_mode == "composition_uot":
+            # relation-composition-only constraint (review §9/§10): the total
+            # graph mass is decided by the unconstrained NullSoftmax plan
+            # (M_i^NS, detached); the UOT constraint only redistributes that
+            # mass ACROSS relations. nu_rel = M_i^NS * a_ik, Local theta=0.
+            # No pi0 anywhere -> truly no artificial Local/Graph total prior.
+            gamma_ns = null_augmented_softmax(s_aug, self.p2_epsilon)
+            m_ns = gamma_ns[..., 1:].sum(dim=(1, 2)).detach()  # [N]
+            nu_rel = torch.cat(
+                [
+                    torch.zeros(num_nodes, 1, dtype=f_block.dtype, device=device),
+                    (m_ns.unsqueeze(-1) * availability),
+                ],
+                dim=-1,
+            )  # [N, K+1]; sums to M_i^NS over graph columns
             theta_col = torch.full(
                 (num_nodes, self.num_relations + 1), graph_theta, dtype=f_block.dtype, device=device
             )
             theta_col[:, 0] = 0.0
             gamma = semi_relaxed_transport(
-                s_aug, nu, self.p2_epsilon, self.p2_tau_base, self.p2_sinkhorn_iters, theta_col
+                s_aug, nu_rel, self.p2_epsilon, self.p2_tau_base, self.p2_sinkhorn_iters, theta_col
             )
             theta = torch.full((num_nodes,), graph_theta, dtype=f_block.dtype, device=device)
         else:

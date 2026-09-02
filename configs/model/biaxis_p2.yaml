@@ -37,9 +37,10 @@ p1:
 
 # --- P2 transport coupling (plan §19) ---
 p2:
-  # null_softmax | fixed_uot | adaptive_uot | relation_uot
-  # relation_uot = relation-capacity-only (review §19): Local column NOT
-  # constrained (theta=0 there), only R1..RK follow the topology capacity.
+  # null_softmax | fixed_uot | adaptive_uot | composition_uot
+  # composition_uot = relation-composition-only (review §9/§10): total graph
+  # mass comes from the unconstrained NullSoftmax plan (detached), the UOT
+  # constraint only redistributes it across R1..RK. No pi0 anywhere.
   mode: adaptive_uot
 
   score_hidden_dim: 64

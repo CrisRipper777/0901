@@ -60,7 +60,7 @@ MODE_OVERRIDES: dict[str, list[str]] = {
     "null_softmax": ["model.p2.mode=null_softmax"],
     "fixed_uot": ["model.p2.mode=fixed_uot"],
     "adaptive_uot": ["model.p2.mode=adaptive_uot"],
-    "relation_uot": ["model.p2.mode=relation_uot"],
+    "composition_uot": ["model.p2.mode=composition_uot"],
 }
 
 

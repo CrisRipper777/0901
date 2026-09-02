@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import statistics
 from pathlib import Path
 
@@ -35,6 +36,7 @@ BASELINE_CSV = PROJECT_ROOT / "outputs" / "baseline_nc" / "nc_baseline_table.csv
 
 DATASETS = ["Movies", "Toys", "Grocery", "ele-fashion", "Reddit-S"]
 FACTORIAL_VARIANTS = ["F0R0", "F1R0", "F0R1", "F1R1"]
+BUDGET_VARIANTS = ["B0", "B1", "B2"]
 METRICS = ["val_acc", "test_acc", "test_macro_f1"]
 REFERENCE_MODELS = ["gcn", "mmgcn", "dip"]
 
@@ -180,12 +182,22 @@ def _mechanism_rows(summaries: list[dict]) -> list[dict]:
         budget = diag.get("budget", {})
         alpha_ent = diag.get("alpha_entropy", {})
         js = diag.get("alpha_js", {})
+        num_relations = len(relation.get("occ", []))
+        edge_entropy = relation.get("mean_edge_entropy")
         row: dict = {
             "dataset": summary["dataset"],
             "variant": summary["variant"],
             "seed": summary["seed"],
             "rel_effective_num": _fmt(relation.get("effective_num")),
-            "rel_edge_entropy": _fmt(relation.get("mean_edge_entropy")),
+            "rel_edge_entropy": _fmt(edge_entropy),
+            # Edge-level relation specialization S_R = 1 - H_R / log K
+            # (review §12: K_eff excludes global occupancy collapse only;
+            # S_R detects per-edge uniform collapse H_R -> log K).
+            "rel_specialization": (
+                _fmt(1.0 - edge_entropy / (math.log(num_relations) if num_relations > 1 else 1.0))
+                if edge_entropy is not None and num_relations > 1
+                else ""
+            ),
         }
         for idx, occ in enumerate(relation.get("occ", [])):
             row[f"rel_occ_{idx}"] = _fmt(occ)
@@ -246,17 +258,19 @@ def _write_report(stage: str, summaries: list[dict], interaction_rows: list[dict
     lines.append("- Decision metric: **validation Accuracy** (test is frozen-checkpoint confirmation only).")
     lines.append("")
 
+    report_variants = BUDGET_VARIANTS if stage == "budget_ablation" else FACTORIAL_VARIANTS
+    grouped: dict[tuple[str, str], list[dict]] = {}
+    for summary in summaries:
+        grouped.setdefault((summary["dataset"], summary["variant"]), []).append(summary)
+
     # Results table (val + test, mean±std over seeds when present).
     lines.append("## Results")
     lines.append("")
     header = "| Dataset | Variant | Best Val Acc | Test Acc | Test F1 |"
     lines.append(header)
     lines.append("|---|" + "---:|" * 4)
-    grouped: dict[tuple[str, str], list[dict]] = {}
-    for summary in summaries:
-        grouped.setdefault((summary["dataset"], summary["variant"]), []).append(summary)
     for dataset in DATASETS:
-        for variant in FACTORIAL_VARIANTS:
+        for variant in report_variants:
             runs = grouped.get((dataset, variant), [])
             if not runs:
                 continue
@@ -270,42 +284,69 @@ def _write_report(stage: str, summaries: list[dict], interaction_rows: list[dict
             )
     lines.append("")
 
-    # Interaction table (val acc rows only, decision metric).
-    lines.append("## Interaction Effects (validation Accuracy)")
-    lines.append("")
-    lines.append("| Dataset | ΔF | ΔR | ΔFR | F1R1−F1R0 | F1R1−F0R1 |")
-    lines.append("|---|" + "---:|" * 5)
-    for row in interaction_rows:
-        if row["metric"] == "val_acc":
-            lines.append(
-                f"| {row['dataset']} | {row['dF']} | {row['dR']} | {row['dFR']} | "
-                f"{row['F1R1-F1R0']} | {row['F1R1-F0R1']} |"
-            )
-    lines.append("")
+    # B0-vs-B2 comparison (budget ablation only; review §5 supplement).
+    if stage == "budget_ablation":
+        lines.append("## B0 vs B2 per seed")
+        lines.append("")
+        lines.append("| Dataset | Seed | B0 val | B2 val | B2−B0 val | B0 test | B2 test |")
+        lines.append("|---|" + "---:|" * 6)
+        for dataset in DATASETS:
+            for seed in sorted({s["seed"] for s in summaries}):
+                b0 = next((s for s in grouped.get((dataset, "B0"), []) if s["seed"] == seed), None)
+                b2 = next((s for s in grouped.get((dataset, "B2"), []) if s["seed"] == seed), None)
+                if b0 is None or b2 is None:
+                    continue
+                b0_val = _metric(b0.get("results"), "val_acc")
+                b2_val = _metric(b2.get("results"), "val_acc")
+                delta = (b2_val - b0_val) if b0_val is not None and b2_val is not None else None
+                lines.append(
+                    f"| {dataset} | {seed} | {_fmt(b0_val)} | {_fmt(b2_val)} | {_fmt(delta)} | "
+                    f"{_fmt(_metric(b0.get('results'), 'test_acc'))} | "
+                    f"{_fmt(_metric(b2.get('results'), 'test_acc'))} |"
+                )
+        lines.append("")
 
-    # Mechanism summary (screen/confirm: F1R1 rows; budget ablation: B rows).
-    lines.append("## Mechanism (F1R1 / full model rows)")
+    # Interaction table (factorial stages only; val acc rows, decision metric).
+    if stage != "budget_ablation":
+        lines.append("## Interaction Effects (validation Accuracy)")
+        lines.append("")
+        lines.append("| Dataset | ΔF | ΔR | ΔFR | F1R1−F1R0 | F1R1−F0R1 |")
+        lines.append("|---|" + "---:|" * 5)
+        for row in interaction_rows:
+            if row["metric"] == "val_acc":
+                lines.append(
+                    f"| {row['dataset']} | {row['dF']} | {row['dR']} | {row['dFR']} | "
+                    f"{row['F1R1-F1R0']} | {row['F1R1-F0R1']} |"
+                )
+        lines.append("")
+
+    # Mechanism summary (all stages).
+    lines.append("## Mechanism")
     lines.append("")
-    lines.append("| Dataset | Variant | Seed | K_eff | beta_C | beta_Pt | beta_Pv | JS C/Pt | JS C/Pv | JS Pt/Pv |")
-    lines.append("|---|" + "---:|" * 9)
+    lines.append("| Dataset | Variant | Seed | K_eff | H_R | S_R | beta_C | beta_Pt | beta_Pv | JS C/Pt | JS C/Pv | JS Pt/Pv |")
+    lines.append("|---|" + "---:|" * 12)
     for summary in summaries:
         diag = summary.get("diagnostics") or {}
+        relation = diag.get("relation", {})
         budget = diag.get("budget", {})
         js = diag.get("alpha_js", {})
+        num_relations = len(relation.get("occ", []))
+        h_r = relation.get("mean_edge_entropy")
+        s_r = 1.0 - h_r / math.log(num_relations) if h_r is not None and num_relations > 1 else None
         lines.append(
             f"| {summary['dataset']} | {summary['variant']} | {summary['seed']} | "
-            f"{_fmt(diag.get('relation', {}).get('effective_num'))} | "
+            f"{_fmt(relation.get('effective_num'))} | {_fmt(h_r)} | {_fmt(s_r)} | "
             f"{_fmt(budget.get('C', {}).get('mean'))} | {_fmt(budget.get('Pt', {}).get('mean'))} | "
             f"{_fmt(budget.get('Pv', {}).get('mean'))} | "
             f"{_fmt(js.get('C_Pt'))} | {_fmt(js.get('C_Pv'))} | {_fmt(js.get('Pt_Pv'))} |"
         )
     lines.append("")
-    lines.append("> Usage matrices are saved per run in `usage_matrix.csv`; they are NOT averaged across seeds (relation prototype permutation, plan §38).")
+    lines.append("> S_R = 1 − H_R/ln(K): edge-level relation specialization (review §12). S_R ≈ 0 means per-edge r is near uniform — K_eff alone cannot detect this. Usage matrices are saved per run in `usage_matrix.csv` and are NOT averaged across seeds (relation prototype permutation, plan §38).")
     lines.append("")
 
-    # Reference lines.
+    # Reference lines (factorial stages only).
     ref = _load_baseline_reference()
-    if ref:
+    if ref and stage != "budget_ablation":
         lines.append("## Reference lines (frozen NC baselines, test Acc ± std)")
         lines.append("")
         lines.append("| Dataset | GCN | MMGCN | DiP |")
@@ -319,29 +360,30 @@ def _write_report(stage: str, summaries: list[dict], interaction_rows: list[dict
         lines.append("> P1 mechanism GO does not require beating DiP (plan §32): scientific line F1R1 > F1R0/F0R1; health line ≈ GCN/MMGCN region; final target is P2/P3.")
         lines.append("")
 
-    # GO criteria (§29) computed evidence.
-    lines.append("## GO / REVISE / NO-GO checklist (plan §29)")
-    lines.append("")
-    val_rows = {row["dataset"]: row for row in interaction_rows if row["metric"] == "val_acc"}
-    dfr_positive = sum(1 for row in val_rows.values() if row["dFR"] and float(row["dFR"].split("±")[0]) > 0)
-    f1r1_gt_f1r0 = sum(1 for row in val_rows.values() if row["F1R1-F1R0"] and float(row["F1R1-F1R0"].split("±")[0]) > 0)
-    f1r1_gt_f0r1 = sum(1 for row in val_rows.values() if row["F1R1-F0R1"] and float(row["F1R1-F0R1"].split("±")[0]) > 0)
-    num_ds = len(val_rows)
-    lines.append(f"- [ ] F1R1 > F1R0 (val) on ≥3/5 datasets — {f1r1_gt_f1r0}/{num_ds} datasets")
-    lines.append(f"- [ ] F1R1 > F0R1 (val) on ≥3/5 datasets — {f1r1_gt_f0r1}/{num_ds} datasets")
-    lines.append(f"- [ ] ΔFR > 0 (val) on ≥3/5 datasets — {dfr_positive}/{num_ds} datasets")
-    collapse = [s for s in summaries if s["variant"] in ("F1R1", "B0", "B1", "B2") and s.get("diagnostics")]
-    if collapse:
-        k_effs = [s["diagnostics"]["relation"]["effective_num"] for s in collapse]
-        occs = [max(s["diagnostics"]["relation"].get("occ", [0])) for s in collapse]
-        lines.append(f"- [ ] No relation collapse — K_eff range {min(k_effs):.2f}-{max(k_effs):.2f} (≈1 fails), max occ {max(occs):.2f} (>0.85 fails)")
-    else:
-        lines.append("- [ ] No relation collapse — no F1R1 diagnostics found")
-    lines.append("- [ ] Node-wise factor-relation JS nonzero with clear differences — see mechanism table")
-    lines.append("- [ ] F1R1 reaches the GCN/MMGCN healthy region — see reference lines")
-    lines.append("")
-    lines.append("- Decision: **PENDING** (fill after analysis)")
-    lines.append("")
+    # GO criteria (§29) computed evidence (factorial stages only).
+    if stage != "budget_ablation":
+        lines.append("## GO / REVISE / NO-GO checklist (plan §29)")
+        lines.append("")
+        val_rows = {row["dataset"]: row for row in interaction_rows if row["metric"] == "val_acc"}
+        dfr_positive = sum(1 for row in val_rows.values() if row["dFR"] and float(row["dFR"].split("±")[0]) > 0)
+        f1r1_gt_f1r0 = sum(1 for row in val_rows.values() if row["F1R1-F1R0"] and float(row["F1R1-F1R0"].split("±")[0]) > 0)
+        f1r1_gt_f0r1 = sum(1 for row in val_rows.values() if row["F1R1-F0R1"] and float(row["F1R1-F0R1"].split("±")[0]) > 0)
+        num_ds = len(val_rows)
+        lines.append(f"- [ ] F1R1 > F1R0 (val) on ≥3/5 datasets — {f1r1_gt_f1r0}/{num_ds} datasets")
+        lines.append(f"- [ ] F1R1 > F0R1 (val) on ≥3/5 datasets — {f1r1_gt_f0r1}/{num_ds} datasets")
+        lines.append(f"- [ ] ΔFR > 0 (val) on ≥3/5 datasets — {dfr_positive}/{num_ds} datasets")
+        collapse = [s for s in summaries if s["variant"] in ("F1R1", "B0", "B1", "B2") and s.get("diagnostics")]
+        if collapse:
+            k_effs = [s["diagnostics"]["relation"]["effective_num"] for s in collapse]
+            occs = [max(s["diagnostics"]["relation"].get("occ", [0])) for s in collapse]
+            lines.append(f"- [ ] No relation collapse — K_eff range {min(k_effs):.2f}-{max(k_effs):.2f} (≈1 fails), max occ {max(occs):.2f} (>0.85 fails)")
+        else:
+            lines.append("- [ ] No relation collapse — no F1R1 diagnostics found")
+        lines.append("- [ ] Node-wise factor-relation JS nonzero with clear differences — see mechanism table")
+        lines.append("- [ ] F1R1 reaches the GCN/MMGCN healthy region — see reference lines")
+        lines.append("")
+        lines.append("- Decision: **PENDING** (fill after analysis)")
+        lines.append("")
 
     report_name = {
         "screen": "P1_SCREEN_REPORT.md",

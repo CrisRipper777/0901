@@ -263,13 +263,16 @@ def test_gradients_flow_to_signature_edge_prototypes() -> None:
     s = sig(edge_index, NUM_NODES)
     e = edge(s, edge_index)
     r = proto(e)
-    r.mean().backward()
+    # NOT r.mean(): sum_k r_k = 1 makes mean(r) a constant with zero effective
+    # gradient (review §20). Use a single slice so the loss is non-constant.
+    r[:, 0].mean().backward()
     for module in (sig, edge, proto):
         params = list(module.parameters())
         assert params
-        assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in params), (
-            f"missing/non-finite gradient in {type(module).__name__}"
-        )
+        for p in params:
+            assert p.grad is not None, f"missing gradient in {type(module).__name__}"
+            assert torch.isfinite(p.grad).all(), f"non-finite gradient in {type(module).__name__}"
+            assert p.grad.norm() > 1e-9, f"zero effective gradient in {type(module).__name__}"
 
 
 # ---------------------------------------------------------------------------
@@ -314,8 +317,17 @@ def test_selector_simplex() -> None:
 def test_selector_gradient_flow() -> None:
     selector = FactorRelationSelector(num_relations=4, factor_dim=16, hidden_dim=32)
     alpha = selector(torch.randn(5, 3, 16), torch.randn(5, 3, 4, 16), torch.randn(5, 4))
-    alpha.mean().backward()
-    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in selector.parameters())
+    # NOT alpha.mean(): sum_k alpha_k = 1 makes mean(alpha) a constant
+    # (review §20). Use a single slice so the gradient is non-zero.
+    alpha[:, :, 0].mean().backward()
+    for name, p in selector.named_parameters():
+        assert p.grad is not None
+        assert torch.isfinite(p.grad).all()
+        if "bias" in name:
+            # Softmax translation invariance: the final bias gradient is
+            # exactly zero for ANY loss depending only on alpha — expected.
+            continue
+        assert p.grad.norm() > 1e-9, f"zero effective gradient in selector {name}"
 
 
 # ---------------------------------------------------------------------------

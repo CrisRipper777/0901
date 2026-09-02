@@ -32,8 +32,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
-def _resolve_cfg(dataset: str, task: str, model_overrides: list[str] | None):
-    overrides = [f"dataset={dataset}", f"task={task}", "model=biaxis_p1"] + list(model_overrides or [])
+def _resolve_cfg(dataset: str, task: str, seed: int, model_overrides: list[str] | None):
+    # seed is included for strict config reproducibility (review §22); P1
+    # diagnostics never use labels/splits so results are unaffected, but the
+    # composed config must match the training run exactly.
+    overrides = [f"dataset={dataset}", f"task={task}", f"seed={int(seed)}", "model=biaxis_p1"] + list(
+        model_overrides or []
+    )
     with initialize(config_path="../configs", version_base=None):
         return compose(config_name="config", overrides=overrides)
 
@@ -54,7 +59,7 @@ def main() -> None:
     args = parser.parse_args()
 
     model_overrides = [item.strip() for item in args.model_overrides.split(",") if item.strip()] or None
-    cfg = _resolve_cfg(args.dataset, args.task, model_overrides)
+    cfg = _resolve_cfg(args.dataset, args.task, args.seed, model_overrides)
 
     from src.data import load_mag_data
     from src.models.biaxis_p1 import Model

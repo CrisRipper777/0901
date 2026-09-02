@@ -1,6 +1,8 @@
 name: biaxis_p1
 
-# --- Frozen P0 semantic factorization (plan §2: M1 must not change) ---
+# --- P0 semantic factorization, architecture/objective unchanged (plan §2:
+#     M1 must not change; NOT weight-frozen — params are jointly optimized,
+#     review §16) ---
 hidden_dim: 256
 factor_dim: 128
 dropout: 0.2

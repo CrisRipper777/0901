@@ -1,7 +1,8 @@
 """P1 Bi-Axis model: Semantic Factor x Structural Relation decoupled graph
-learning on top of the frozen P0 semantic factorizer.
+learning on top of the P0 semantic factorizer (architecture/objective kept
+unchanged and JOINTLY optimized — review §16: P1 reuses, not weight-freezes).
 
-    x_t, x_v -> P0 factorizer -> C / Pt / Pv           (M1, frozen)
+    x_t, x_v -> P0 factorizer -> C / Pt / Pv           (M1, unchanged arch/obj, jointly trained)
     A -> topology signature -> R1..RK                  (M2, topology-only)
     beta_i^f  = sigmoid(MLP_B[f_i || g_bar_i^f])       (M3a, how much graph)
     alpha_ifk = Softmax_k(MLP_R[f_i || g_ik^f || f_i*g_ik^f || a_ik])  (M3b, which relation)
@@ -45,7 +46,8 @@ from .common import get_activation, make_norm
 
 class Model(P0Model):
     """Bi-Axis P1. Inherits the P0 factorizer / recon heads / fusion / aux
-    losses unchanged (M1 frozen) and adds the graph-side modules (M2 + M3)."""
+    losses (architecture & objective unchanged, jointly optimized) and adds
+    the graph-side modules (M2 + M3)."""
 
     def __init__(self, cfg, data_info):
         super().__init__(cfg, data_info)
@@ -65,7 +67,6 @@ class Model(P0Model):
 
         activation = str(cfg.model.get("activation", "gelu"))
         norm = str(cfg.model.get("norm", "layernorm"))
-        num_factors = 3 if self.factor_aware else 1
 
         # --- M2: topology-only relation decomposition ---------------------
         self.struct_signature_mlp = TopologyDiffusionSignature(self.relation_dim, activation)
@@ -75,9 +76,11 @@ class Model(P0Model):
         )
 
         # --- M3: factor-side graph consumers ------------------------------
-        budget_factor_dim = num_factors * self.factor_dim if self.budget_shared else self.factor_dim
+        # Shared budget (B1) uses the SAME 128-d network as factor-specific
+        # (B2): f_shared = mean_f f (review §17 — the old [F*d]-concat input
+        # gave B1 MORE parameters than B2, an unclean ablation).
         self.graph_budget = FactorGraphBudget(
-            budget_factor_dim,
+            self.factor_dim,
             hidden_dim=int(p1.budget_hidden_dim),
             activation=activation,
         )
@@ -195,8 +198,12 @@ class Model(P0Model):
         # --- M3a: factor graph budget (how much graph evidence) -----------
         if self.use_graph_budget:
             if self.budget_shared:
-                f_shared = f_cat  # [N, F*d]
-                beta_shared = self.graph_budget(f_shared, g_bar)  # [N]
+                # B1: one per-node budget shared across factors, computed from
+                # the factor-mean state with the same 128-d network as B2
+                # (review §17: matched parameter capacity).
+                f_shared = f_block.mean(dim=1)  # [N, d]
+                g_bar_shared = g_bar_f.mean(dim=1)  # [N, d]
+                beta_shared = self.graph_budget(f_shared, g_bar_shared)  # [N]
                 beta = beta_shared.unsqueeze(-1).expand(num_nodes, num_factors)
             else:
                 beta = self.graph_budget(f_block, g_bar_f)  # [N, F]

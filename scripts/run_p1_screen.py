@@ -122,9 +122,40 @@ def _run_job(
     epochs: int | None,
     no_diagnostics: bool,
     extra_overrides: list[str] | None = None,
+    gpu_locks: dict[int, threading.Semaphore] | None = None,
+    num_seeds: int = 1,
 ) -> None:
+    # Per-GPU mutual exclusion (review §21): the executor may schedule a job
+    # whose pre-assigned GPU is still busy; the semaphore forces one process
+    # per physical GPU so peak-memory/runtime numbers stay meaningful.
+    lock = (gpu_locks or {}).get(gpu_id)
+    if lock is not None:
+        lock.acquire()
+    try:
+        _run_job_locked(
+            dataset, variant, seed, gpu_id, stage, out_root, force, epochs, no_diagnostics,
+            extra_overrides, num_seeds,
+        )
+    finally:
+        if lock is not None:
+            lock.release()
+
+
+def _run_job_locked(
+    dataset: str,
+    variant: str,
+    seed: int,
+    gpu_id: int,
+    stage: str,
+    out_root: str,
+    force: bool,
+    epochs: int | None,
+    no_diagnostics: bool,
+    extra_overrides: list[str] | None = None,
+    num_seeds: int = 1,
+) -> None:
+    """Job body; the caller holds the per-GPU semaphore."""
     overrides = _variant_overrides(stage, variant) + list(extra_overrides or [])
-    num_seeds = len(CONFIRM_SEEDS) if stage == "confirm" else 1
     outdir = _run_dir(out_root, dataset, variant, seed, num_seeds)
     outdir.mkdir(parents=True, exist_ok=True)
     tag = f"[{gpu_id}] {dataset} {variant} seed={seed}"
@@ -254,11 +285,18 @@ def main() -> None:
         default="",
         help="extra comma-separated overrides appended to every job (revise experiments)",
     )
+    parser.add_argument(
+        "--seeds",
+        default=None,
+        help="comma-separated seed override (supplementary experiments, e.g. 43,44)",
+    )
     args = parser.parse_args()
 
     datasets_all, variants, seeds, out_root = _stage_config(args.stage)
     if args.out_root:
         out_root = args.out_root
+    if args.seeds:
+        seeds = [int(seed.strip()) for seed in args.seeds.split(",") if seed.strip()]
     extra_overrides = [item.strip() for item in args.model_overrides.split(",") if item.strip()]
     datasets = datasets_all
     if args.datasets:
@@ -285,13 +323,15 @@ def main() -> None:
         f"out={out_root} epochs={args.epochs} force={args.force}",
         flush=True,
     )
+    gpu_locks = {gpu_id: threading.Semaphore(1) for gpu_id in gpus}
     with ThreadPoolExecutor(max_workers=len(gpus)) as executor:
         futures = {}
         for job in jobs:
             dataset, variant, seed = job
             gpu_id = pinned.get(dataset, next(gpu_iter))
             futures[executor.submit(
-                _run_job, dataset, variant, seed, gpu_id, args.stage, out_root, args.force, args.epochs, args.no_diagnostics, extra_overrides
+                _run_job, dataset, variant, seed, gpu_id, args.stage, out_root, args.force,
+                args.epochs, args.no_diagnostics, extra_overrides, gpu_locks, len(seeds)
             )] = job
         for future in as_completed(futures):
             job = futures[future]

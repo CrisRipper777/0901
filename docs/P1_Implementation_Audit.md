@@ -25,7 +25,7 @@ class Model(P0Model):
 ```
 
 - P0 `__init__` 只读 `cfg.model` 的 P0 keys（`hidden_dim/factor_dim/dropout/activation/norm/lambda_*`），P1 config（`configs/model/biaxis_p1.yaml`）**完整复制这些 keys 并保持 frozen 数值**，另加 `p1:` 块。P1 的 `__init__` 只读 `cfg.model.p1.*`。
-- 复用的成员：`self.factorizer`（`SemanticFactorizer`，M1 冻结）、`self.recon_text_head/recon_visual_head`、`self.fusion`（P0 融合，F1 路径复用）、`self._encode/_split_modalities/_compute_aux`、`self.out_dim=256`、`self.encode_factors`（诊断对照用）。
+- 复用的成员：`self.factorizer`（`SemanticFactorizer`，M1 **架构/目标不变但 jointly optimized**，非 weight-frozen——参数照常进 optimizer 并接收梯度）、`self.recon_text_head/recon_visual_head`、`self.fusion`（P0 融合，F1 路径复用）、`self._encode/_split_modalities/_compute_aux`、`self.out_dim=256`、`self.encode_factors`（诊断对照用）。
 - P1 覆盖：`forward()`、`inference()`。aux loss 在 graph module **之前**从 pre-graph factors 计算（与 P0 完全相同的数值路径），P0 三项损失保持不变。
 - `self.requires_full_graph_training = True`（对齐 `dip.py:303` 的既有模式）：即使 `task.training_mode` 被误设为 sampled，也强制 full-graph——P1 的 relation 分解依赖完整 topology。这是 model 属性，不是协议修改。
 
@@ -65,7 +65,7 @@ self.register_buffer("_cached_raw_struct_signature", torch.empty(0), persistent=
 
 - 统一模型 `biaxis_p1.py`；内部统一 `[N, F, d_f]` 表示，`F = 3`（factor-aware）或 `1`（factor-blind），`K = 1 | 4`。
 - `model.p1.factor_aware=false model.p1.num_relations=1` → F0R0；`true/1` → F1R0；`false/4` → F0R1；`true/4` → F1R1。
-- **F=1 路径**：仍先跑完整 P0 factorizer（M1 冻结、aux loss 照常），再 `q = Proj_q(self.fusion([C‖Pt‖Pv])) ∈ R^{d_f}`（plan §15 定义），graph module 只作用于 q；输出 `z = fusion_q(q') ∈ R^{256}`（`fusion_q` 结构对齐 P0 fusion：Linear→LN→GELU→Dropout）。**F=1 的 graph module 看不到 factor identity**——这就是 Factor OFF 的定义（不是重训无解耦 encoder）。
+- **F=1 路径**：仍先跑完整 P0 factorizer（M1 架构/目标不变、jointly optimized、aux loss 照常），再 `q = Proj_q(self.fusion([C‖Pt‖Pv])) ∈ R^{d_f}`（plan §15 定义），graph module 只作用于 q；输出 `z = fusion_q(q') ∈ R^{256}`（`fusion_q` 结构对齐 P0 fusion：Linear→LN→GELU→Dropout）。**F=1 的 graph module 看不到 factor identity**——这就是 Factor OFF 的定义（不是重训无解耦 encoder）。
 - **F=3 路径**：graph module 作用于 `[C, Pt, Pv]`，输出 `z = self.fusion([C'‖Pt'‖Pv'])`。
 - **K=1 fast path**：`r = ones(E,1)`（不跑 prototype softmax），`alpha = ones(N,F,1)`（不跑 selector），聚合退化为普通邻居均值，budget 照常。plan §22 要求。
 - F0/F1 参数差仅 `Proj_q + fusion_q ≈ 131K`，可接受（plan 接受同一 factorizer 下的实现差异；记录进 Params 列）。
@@ -105,7 +105,7 @@ self.register_buffer("_cached_raw_struct_signature", torch.empty(0), persistent=
 ```text
 src/models/biaxis_p1_components.py   M2 relation 分解 + M3 budget/selector
 src/models/biaxis_p1.py              主模型（继承 P0 Model）
-configs/model/biaxis_p1.yaml         默认配置（frozen P0 keys + p1 块）
+configs/model/biaxis_p1.yaml         默认配置（P0 keys 数值不变 + p1 块）
 tests/test_biaxis_p1.py              单元测试（plan §24 清单）
 scripts/run_p1_screen.py             screen 批跑（resume/skip、双卡）
 scripts/run_p1_confirm.py            confirm 批跑（screen GO 后）

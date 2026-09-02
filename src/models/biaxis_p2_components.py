@@ -198,3 +198,131 @@ def semi_relaxed_transport(
     log_u = log_mu - torch.logsumexp(log_k + log_v[:, None, :], dim=-1, keepdim=True)
     log_gamma = log_u + log_k + log_v[:, None, :]
     return torch.exp(log_gamma)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic aggregation (verification mode, 2026-09-02 reproducibility
+# analysis): replaces GPU-atomic index_add accumulation with CSR SpMM /
+# cumsum-based segment reductions. Results are bitwise reproducible across
+# runs on the same GPU. Default training path is UNCHANGED (atomics are
+# faster); this mode exists for determinism-verification sweeps only.
+# ---------------------------------------------------------------------------
+
+
+def _hillis_steele_scan(x: torch.Tensor) -> torch.Tensor:
+    """Inclusive scan with an order FIXED BY CODE (Hillis-Steele doubling).
+
+    Pure elementwise / slice / cat ops — no atomics, no cumsum (torch's CUDA
+    cumsum is empirically cross-process unstable at 1e6-element float32:
+    its inter-block prefix goes through atomic ordering, and float32 ulp at
+    1e6 magnitude is 2^-4 — exactly the quanta observed). The summation
+    TREE here is fixed, so results are bitwise reproducible."""
+    y = x
+    shift = 1
+    num_rows, d = x.shape
+    while shift < num_rows:
+        shifted = torch.cat(
+            [torch.zeros(shift, d, dtype=x.dtype, device=x.device), y[:-shift]], dim=0
+        )
+        y = y + shifted
+        shift *= 2
+    return y
+
+
+def _csr_chunk_aggregate(
+    dst: torch.Tensor,
+    values: torch.Tensor,
+    num_nodes: int,
+    block_size: int = 2048,
+) -> torch.Tensor:
+    """Deterministic segment aggregation (sum of values grouped by dst).
+
+    No atomics, no cumsum, no sparse.mm (all measured cross-process
+    nondeterministic): argsort (stable) + per-block Hillis-Steele scan with
+    a serial cross-block prefix — the entire accumulation order is fixed by
+    code, bitwise reproducible across processes."""
+    num_edges = int(dst.size(0))
+    order = torch.argsort(dst, stable=True)
+    s_dst = dst[order]
+    s_vals = values[order]
+
+    scanned_blocks: list[torch.Tensor] = []
+    prefix = torch.zeros(s_vals.size(-1), dtype=s_vals.dtype, device=s_vals.device)
+    for start in range(0, num_edges, block_size):
+        end = min(start + block_size, num_edges)
+        block = s_vals[start:end]
+        scanned = _hillis_steele_scan(block) + prefix
+        # Block total in the FIXED scan order (last row of the inclusive
+        # scan) — avoids torch.sum, whose reduction may use atomics.
+        prefix = scanned[-1].clone()
+        scanned_blocks.append(scanned)
+    cum = torch.cat(scanned_blocks, dim=0)  # [E, d] inclusive scan
+    # cum_aug[i] = sum of the first i sorted rows (leading zero row) so that
+    # segment sum [start, end) = cum_aug[end] - cum_aug[start].
+    cum_aug = torch.cat(
+        [torch.zeros(1, s_vals.size(-1), dtype=s_vals.dtype, device=s_vals.device), cum], dim=0
+    )  # [E+1, d]
+
+    change = torch.ones(num_edges, dtype=torch.bool, device=dst.device)
+    change[1:] = s_dst[1:] != s_dst[:-1]
+    starts = change.nonzero(as_tuple=True)[0]
+    ends = torch.cat([starts[1:], torch.tensor([num_edges], device=dst.device)])
+    sums = cum_aug[ends] - cum_aug[starts]  # [S, d]
+    out = torch.zeros(num_nodes, s_vals.size(-1), dtype=s_vals.dtype, device=s_vals.device)
+    out[s_dst[starts]] = sums  # unique-index scatter: one write per row
+    return out
+
+
+def deterministic_relation_weighted_mean(
+    edge_index: torch.Tensor,
+    r: torch.Tensor,
+    features: torch.Tensor,
+    num_nodes: int,
+    edge_chunk_size: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Deterministic twin of ``relation_weighted_mean`` (same signature and
+    return: g [N,K,d], mass [N,K]). Chunks are accumulated serially in fixed
+    order, each chunk via CSR SpMM -> bitwise reproducible."""
+    src, dst = edge_index[0], edge_index[1]
+    num_edges = int(edge_index.size(1))
+    k = int(r.size(1))
+    dim = int(features.size(-1))
+    dtype = features.dtype
+
+    acc = torch.zeros(num_nodes, k, dim, dtype=dtype, device=features.device)
+    mass = torch.zeros(num_nodes, k, dtype=r.dtype, device=r.device)
+
+    chunk = num_edges if edge_chunk_size is None else int(edge_chunk_size)
+    for start in range(0, num_edges, chunk):
+        end = min(start + chunk, num_edges)
+        src_c, dst_c = src[start:end], dst[start:end]
+        r_c = r[start:end]
+        mass += _csr_chunk_aggregate(dst_c, r_c, num_nodes)  # [N, K]
+        for rel in range(k):
+            weighted = r_c[:, rel].unsqueeze(-1) * features[src_c]  # [E_c, d]
+            acc[:, rel] += _csr_chunk_aggregate(dst_c, weighted, num_nodes)
+    g = acc / (mass.unsqueeze(-1) + _EPS)
+    return g, mass
+
+
+def deterministic_node_relation_confidence(
+    r: torch.Tensor,
+    edge_index: torch.Tensor,
+    num_nodes: int,
+    detach: bool = True,
+) -> torch.Tensor:
+    """Deterministic twin of ``compute_node_relation_confidence`` (CSR SpMM
+    instead of index_add atomics; no cumsum — cumsum_cuda_kernel has no
+    deterministic implementation in torch 2.4)."""
+    r = torch.as_tensor(r)
+    num_relations = int(r.size(1))
+    edge_entropy = -(r * torch.log(r + _EPS)).sum(dim=-1)  # [E]
+    dst = edge_index[1]
+    acc = _csr_chunk_aggregate(dst, edge_entropy.unsqueeze(-1), num_nodes).squeeze(-1)  # [N]
+    degree = torch.bincount(dst, minlength=num_nodes).to(r.dtype)
+    hbar = acc / (degree + _EPS)
+    q = (1.0 - hbar / (torch.log(torch.tensor(float(num_relations), dtype=r.dtype, device=r.device)))).clamp(0.0, 1.0)
+    q = torch.where(degree <= 0, torch.zeros_like(q), q)
+    if detach:
+        q = q.detach()
+    return q

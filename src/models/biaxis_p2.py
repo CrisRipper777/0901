@@ -25,16 +25,21 @@ modules are DELETED (no unused params); P1 files are never modified.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 
 from .biaxis_p1 import Model as P1Model
-from .biaxis_p1_components import relation_weighted_mean
+from .biaxis_p1_components import relation_availability, relation_weighted_mean
 from .biaxis_p2_components import (
     FactorRelationScore,
+    _csr_chunk_aggregate,
     build_augmented_scores,
     build_reference_capacity,
     compute_node_relation_confidence,
+    deterministic_node_relation_confidence,
+    deterministic_relation_weighted_mean,
     null_augmented_softmax,
     semi_relaxed_transport,
 )
@@ -84,6 +89,47 @@ class Model(P1Model):
         self.p2_tau_base = float(p2.tau_base)
         self.p2_sinkhorn_iters = int(p2.sinkhorn_iters)
         self.p2_null_prior = float(p2.null_prior)
+        # Deterministic verification mode (2026-09-02 reproducibility
+        # analysis): (1) replaces GPU-atomic index_add aggregation with CSR
+        # SpMM / cumsum reductions; (2) enables torch's deterministic
+        # algorithms + cuBLAS workspace (kills cuBLAS/cuSPARSE split-K
+        # atomics). Bitwise-reproducible across processes. Default training
+        # path unchanged (atomics are faster).
+        self.p2_deterministic = bool(p2.get("deterministic", False))
+        if self.p2_deterministic:
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+            # warn_only: GEMMs become deterministic; cumsum (no guaranteed
+            # deterministic impl in 2.4, empirically stable) is allowed with
+            # a warning; atomics/sparse.mm are avoided by the code paths.
+            torch.use_deterministic_algorithms(True, warn_only=True)
+
+    # ------------------------------------------------------------------
+    # Deterministic raw signature (verification mode)
+    # ------------------------------------------------------------------
+
+    def _get_raw_signature(self, edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
+        """Deterministic override of the P1 topology signature (the inherited
+        implementation uses index_add atomics in the two diffusion steps).
+        Same cache semantics as P1 (_sig_cache_*)."""
+        if not self.p2_deterministic:
+            return super()._get_raw_signature(edge_index, num_nodes)
+        if self._sig_cache_n == num_nodes and self._sig_cache_ptr == edge_index.data_ptr():
+            return self._sig_cache_raw
+        src, dst = edge_index[0], edge_index[1]
+        deg = torch.bincount(dst, minlength=num_nodes).to(torch.float32)
+        u0 = torch.log1p(deg)
+
+        def _step(v: torch.Tensor) -> torch.Tensor:
+            aggr = _csr_chunk_aggregate(dst, v[src].unsqueeze(-1), num_nodes).squeeze(-1)
+            return aggr / (deg + 1e-8)
+
+        u1 = _step(u0)
+        u2 = _step(u1)
+        raw = torch.stack([u0, u1, u2], dim=1).detach()
+        self._sig_cache_raw.resize_(raw.size(0), raw.size(1)).copy_(raw)
+        self._sig_cache_ptr = edge_index.data_ptr()
+        self._sig_cache_n = num_nodes
+        return self._sig_cache_raw
 
     # ------------------------------------------------------------------
     # P2 coupling (plan §44): unified plan
@@ -100,12 +146,23 @@ class Model(P1Model):
         device = f_block.device
 
         r, availability, deg = self._decompose_relations(edge_index, num_nodes)
+        if self.p2_deterministic:
+            # _decompose_relations computes relation mass via index_add
+            # atomics (P1 frozen code); recompute it deterministically here.
+            mass_det = _csr_chunk_aggregate(edge_index[1], r, num_nodes)
+            availability = relation_availability(mass_det, deg)
 
-        # Relation-specific factor contexts (reuse P1 aggregation, plan §5).
+        # Relation-specific factor contexts (reuse P1 aggregation, plan §5;
+        # deterministic twin available via p2.deterministic).
         f_cat = f_block.reshape(num_nodes, num_factors * factor_dim)
-        g_cat, _mass = relation_weighted_mean(
-            edge_index, r, f_cat, num_nodes, edge_chunk_size=self.edge_chunk_size
-        )  # [N, K, F*d]
+        if self.p2_deterministic:
+            g_cat, _mass = deterministic_relation_weighted_mean(
+                edge_index, r, f_cat, num_nodes, edge_chunk_size=self.edge_chunk_size
+            )
+        else:
+            g_cat, _mass = relation_weighted_mean(
+                edge_index, r, f_cat, num_nodes, edge_chunk_size=self.edge_chunk_size
+            )  # [N, K, F*d]
         g_perm = g_cat.reshape(num_nodes, self.num_relations, num_factors, factor_dim)
         g_perm = g_perm.permute(0, 2, 1, 3)  # [N, F, K, d]
 
@@ -125,9 +182,14 @@ class Model(P1Model):
 
         # --- relation specialization confidence (detached by default,
         # plan §17; switch per review §17b) ---------------------------------
-        q = compute_node_relation_confidence(
-            r, edge_index, num_nodes, detach=self.p2_detach_relation_confidence
-        )  # [N]
+        if self.p2_deterministic:
+            q = deterministic_node_relation_confidence(
+                r, edge_index, num_nodes, detach=self.p2_detach_relation_confidence
+            )
+        else:
+            q = compute_node_relation_confidence(
+                r, edge_index, num_nodes, detach=self.p2_detach_relation_confidence
+            )  # [N]
 
         # --- plan solver (plan §26) ----------------------------------------
         graph_theta = self.p2_tau_base / (self.p2_tau_base + self.p2_epsilon)

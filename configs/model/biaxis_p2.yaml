@@ -52,6 +52,11 @@ p2:
   null_prior: 0.5
   null_score_init: 0.0
 
+  # Deterministic verification mode (bitwise-reproducible runs): replaces
+  # GPU-atomic aggregation with CSR SpMM / cumsum reductions. Default false
+  # (atomics are faster); enable only for reproducibility sweeps.
+  deterministic: false
+
   detach_capacity_prior: true
   detach_relation_confidence: true
 

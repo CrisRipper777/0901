@@ -642,3 +642,62 @@ def test_p2_composition_uot_preserves_ns_total_graph_mass() -> None:
 def test_p2_rejects_old_relation_uot_mode() -> None:
     with pytest.raises(AssertionError):
         _make_p2_model("relation_uot")
+
+
+# ---------------------------------------------------------------------------
+# Deterministic aggregation (verification mode)
+# ---------------------------------------------------------------------------
+
+
+def test_deterministic_weighted_mean_matches_atomic_version() -> None:
+    from src.models.biaxis_p1_components import relation_weighted_mean
+    from src.models.biaxis_p2_components import deterministic_relation_weighted_mean
+
+    edge_index = torch.randint(0, N, (2, 100))
+    features = torch.randn(N, 8)
+    r = torch.rand(100, K)
+    r = r / r.sum(dim=-1, keepdim=True)
+    g_atomic, m_atomic = relation_weighted_mean(edge_index, r, features, N)
+    g_det, m_det = deterministic_relation_weighted_mean(edge_index, r, features, N, edge_chunk_size=33)
+    assert torch.allclose(g_atomic, g_det, atol=1e-4)
+    assert torch.allclose(m_atomic, m_det, atol=1e-5)
+
+
+def test_deterministic_weighted_mean_bitwise_repeatable() -> None:
+    from src.models.biaxis_p2_components import deterministic_relation_weighted_mean
+
+    edge_index = torch.randint(0, N, (2, 100))
+    features = torch.randn(N, 8)
+    r = torch.rand(100, K)
+    r = r / r.sum(dim=-1, keepdim=True)
+    g1, m1 = deterministic_relation_weighted_mean(edge_index, r, features, N)
+    g2, m2 = deterministic_relation_weighted_mean(edge_index, r, features, N)
+    assert torch.equal(g1, g2)
+    assert torch.equal(m1, m2)
+
+
+def test_deterministic_confidence_matches_and_repeatable() -> None:
+    from src.models.biaxis_p2_components import (
+        compute_node_relation_confidence,
+        deterministic_node_relation_confidence,
+    )
+
+    r = _rand_r()
+    edge_index = torch.randint(0, N, (2, 30))
+    q_atomic = compute_node_relation_confidence(r, edge_index, N)
+    q_det_1 = deterministic_node_relation_confidence(r, edge_index, N)
+    q_det_2 = deterministic_node_relation_confidence(r, edge_index, N)
+    assert torch.allclose(q_atomic, q_det_1, atol=1e-5)
+    assert torch.equal(q_det_1, q_det_2)
+
+
+def test_p2_deterministic_flag_forward() -> None:
+    model = _make_p2_model("composition_uot", deterministic=True)
+    assert model.p2_deterministic
+    model.eval()
+    x = _make_p2_x()
+    edge_index = _make_p2_edge_index()
+    z, _, _, _, _ = model(x, edge_index)
+    assert torch.isfinite(z).all()
+    out = model._graph_update(torch.randn(P2_NUM_NODES, 3, P2_FACTOR_DIM), edge_index, P2_NUM_NODES)
+    assert torch.allclose(out["gamma"].sum(dim=-1), torch.ones(P2_NUM_NODES, 3), atol=1e-5)

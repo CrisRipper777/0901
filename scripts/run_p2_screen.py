@@ -79,6 +79,31 @@ def _run_dir(out_root: str, dataset: str, mode: str, seed: int, num_seeds: int) 
     return base
 
 
+# Datasets whose training peak (~18GB for ele-fashion) claims a full card.
+LARGE_DATASETS = {"ele-fashion"}
+
+
+class _WeightedSemaphore:
+    """Per-GPU slot pool: large jobs take ``slots_per_gpu`` slots (full card),
+    small jobs take 1 — small jobs pack together, large jobs never overlap
+    anything on their card."""
+
+    def __init__(self, value: int) -> None:
+        self._cond = threading.Condition()
+        self._value = int(value)
+
+    def acquire(self, n: int = 1) -> None:
+        with self._cond:
+            while self._value < n:
+                self._cond.wait()
+            self._value -= n
+
+    def release(self, n: int = 1) -> None:
+        with self._cond:
+            self._value += n
+            self._cond.notify_all()
+
+
 def _run_job(
     dataset: str,
     mode: str,
@@ -89,17 +114,19 @@ def _run_job(
     force: bool,
     epochs: int | None,
     no_diagnostics: bool,
-    gpu_locks: dict[int, threading.Semaphore],
+    gpu_locks: dict[int, _WeightedSemaphore],
     num_seeds: int,
+    slots_per_gpu: int = 1,
 ) -> None:
     lock = gpu_locks.get(gpu_id)
+    weight = int(slots_per_gpu) if dataset in LARGE_DATASETS else 1
     if lock is not None:
-        lock.acquire()
+        lock.acquire(weight)
     try:
         _run_job_locked(dataset, mode, seed, gpu_id, out_root, force, epochs, no_diagnostics, num_seeds)
     finally:
         if lock is not None:
-            lock.release()
+            lock.release(weight)
 
 
 def _run_job_locked(
@@ -215,6 +242,13 @@ def main() -> None:
     parser.add_argument("--no-diagnostics", action="store_true")
     parser.add_argument("--out-root", default=None, help="override output root (smoke/revise experiments)")
     parser.add_argument(
+        "--slots-per-gpu",
+        type=int,
+        default=1,
+        help="concurrent jobs per GPU: large datasets (ele-fashion) take ALL "
+        "slots (full card), small datasets take 1 and pack together",
+    )
+    parser.add_argument(
         "--mode-def",
         action="append",
         default=[],
@@ -246,16 +280,20 @@ def main() -> None:
     jobs = sorted([(d, m, s) for d in datasets for m in modes for s in seeds], key=lambda j: order.get(j[0], 9))
     pinned: dict[str, int] = {}
     gpu_iter = iter(gpus * (len(jobs) // len(gpus) + 1))
-    gpu_locks = {gpu_id: threading.Semaphore(1) for gpu_id in gpus}
-    print(f"[driver] stage={args.stage} jobs={len(jobs)} gpus={gpus} out={out_root}", flush=True)
-    with ThreadPoolExecutor(max_workers=len(gpus)) as executor:
+    slots = max(1, int(args.slots_per_gpu))
+    gpu_locks = {gpu_id: _WeightedSemaphore(slots) for gpu_id in gpus}
+    print(
+        f"[driver] stage={args.stage} jobs={len(jobs)} gpus={gpus} slots/gpu={slots} out={out_root}",
+        flush=True,
+    )
+    with ThreadPoolExecutor(max_workers=len(gpus) * slots) as executor:
         futures = {}
         for job in jobs:
             dataset, mode, seed = job
             gpu_id = pinned.get(dataset, next(gpu_iter))
             futures[executor.submit(
                 _run_job, dataset, mode, seed, gpu_id, args.stage, out_root, args.force,
-                args.epochs, args.no_diagnostics, gpu_locks, len(seeds)
+                args.epochs, args.no_diagnostics, gpu_locks, len(seeds), slots
             )] = job
         for future in as_completed(futures):
             job = futures[future]

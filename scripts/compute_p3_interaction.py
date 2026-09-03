@@ -76,9 +76,14 @@ def _interaction(t_cells: torch.Tensor, w0_norm: float, usage: torch.Tensor) -> 
     tbar_all = t_cells.mean(dim=(0, 1), keepdim=True)
     i_cells = t_cells - tbar_f - tbar_k + tbar_all
     i_norms = i_cells.norm(p="fro", dim=(2, 3)) / (w0_norm + EPS)  # [F, K]
+    raw = (usage * i_norms).sum()
+    total = usage.sum()
     return {
         "norms": [[float(v) for v in row] for row in i_norms.tolist()],
-        "usage_weighted_strength": float((usage * i_norms).sum().item()),
+        # review-2 §2: raw = total interaction exposure; normalized =
+        # usage-weighted AVERAGE (comparable across datasets).
+        "usage_weighted_strength": float(raw.item()),
+        "usage_weighted_average": float((raw / (total + EPS)).item()),
     }
 
 
@@ -145,16 +150,18 @@ def main() -> None:
             "mode": info["mode"],
             "seed": info["seed"],
             "interaction_strength": f"{result['usage_weighted_strength']:.6f}",
+            "interaction_average": f"{result['usage_weighted_average']:.6f}",
         })
         print(
             f"[interaction] {info['dataset']} {info['mode']} seed={info['seed']} "
-            f"strength={result['usage_weighted_strength']:.6f}",
+            f"strength={result['usage_weighted_strength']:.6f} "
+            f"average={result['usage_weighted_average']:.6f}",
             flush=True,
         )
 
     if rows:
         csv_path = root / "interaction_summary.csv"
-        fieldnames = ["dataset", "mode", "seed", "interaction_strength"]
+        fieldnames = ["dataset", "mode", "seed", "interaction_strength", "interaction_average"]
         with csv_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()

@@ -265,16 +265,25 @@ def _interaction_diagnostic(
         I_fk = T_fk - Tbar_f· - Tbar_·k + Tbar_··
 
     Defined on the final effective operators, invariant to how A/B/C absorb
-    each other (unlike ||C_fk||). Reports ||I_fk||_F / ||W0||_F per cell and
-    the usage-weighted strength sum_fk u_fk ||I_fk||_F / ||W0||_F."""
+    each other (unlike ||C_fk||). Reports ||I_fk||_F / ||W0||_F per cell plus
+    TWO summary strengths (review-2 §2):
+      - usage_weighted_strength (raw): sum_fk u_fk ||I_fk|| / ||W0||
+        (total interaction exposure; u_fk sums to the total graph mass < 1)
+      - usage_weighted_average (normalized): sum_fk u_fk ||I_fk|| /
+        ((sum_fk u_fk) ||W0|| + eps) — mean interaction strength over
+        actually-used cells, comparable across datasets.
+    """
     tbar_f = t_cells.mean(dim=1, keepdim=True)  # [F, 1, d, d]
     tbar_k = t_cells.mean(dim=0, keepdim=True)  # [1, K, d, d]
     tbar_all = t_cells.mean(dim=(0, 1), keepdim=True)  # [1, 1, d, d]
     interaction = t_cells - tbar_f - tbar_k + tbar_all  # [F, K, d, d]
     i_norms = interaction.norm(p="fro", dim=(2, 3)) / (w0_norm + _EPS)  # [F, K]
+    raw = (usage * i_norms).sum()
+    total = usage.sum()
     return {
         "norms": [[float(v) for v in row] for row in i_norms.cpu().tolist()],
-        "usage_weighted_strength": float((usage * i_norms).sum().item()),
+        "usage_weighted_strength": float(raw.item()),
+        "usage_weighted_average": float((raw / (total + _EPS)).item()),
     }
 
 
@@ -508,8 +517,13 @@ class BasisCellOperator(nn.Module):
         self.dim = int(dim)
         self.num_bases = int(num_bases)
 
+        # Per-basis Xavier (review §9): a 3-D [B, d, d] Xavier call uses the
+        # WHOLE tensor's fan-in/out (scale ~0.018 at d=128), ~8x smaller than
+        # the per-matrix bound sqrt(6/(d+d)) ~= 0.153. Each V_b must be
+        # initialized as an independent [d, d] linear map.
         self.V = nn.Parameter(torch.empty(self.num_bases, self.dim, self.dim))
-        nn.init.xavier_uniform_(self.V)
+        for b in range(self.num_bases):
+            nn.init.xavier_uniform_(self.V[b])
         self.c = nn.Parameter(torch.zeros(self.num_factors, self.num_relations, self.num_bases))
 
     def extra_residual_params(self) -> int:
@@ -608,6 +622,147 @@ class BasisCellOperator(nn.Module):
         return {
             "mode": self.mode,
             "num_bases": self.num_bases,
+            "w0_norm": w0_norm,
+            "residual_norms": {
+                "factor": [],
+                "relation": [],
+                "pair": r_c,
+            },
+            "usage": usage.cpu().tolist(),
+            "pair_strength": pair_strength,
+            "operator_distance": {
+                "same_relation_across_factors": same_relation,
+                "same_factor_across_relations": same_factor,
+            },
+            "message_deviation_usage_weighted": float(
+                delta_weighted_sum / (gamma_total + _EPS)
+            ),
+            "extra_residual_params": self.extra_residual_params(),
+            "interaction": _interaction_diagnostic(t_cells, w0_norm, usage),
+        }
+
+
+class DirectCellOperator(nn.Module):
+    """Direct Cell Operator (review-2 §10-§12):
+
+        T_fk = W0 + D_fk,   D in R^{F x K x d x d}, zero-init.
+
+    No A_f / B_k / C_fk decomposition. The effective function class is
+    EXACTLY that of OFR (review-2 §11: D_fk = A_f+B_k+C_fk in one direction;
+    A=B=0, C=D in the other), while residual parameters drop from
+    19*d^2 = 311,296 to 12*d^2 = 196,608 (−36.8%) with no A/B/C
+    identifiability ambiguity.
+
+    Step 0: D=0 -> T_fk = W0 exactly (zero-init discipline preserved).
+    The interaction diagnostic still double-centers the effective T_fk.
+
+    Memory discipline: per-cell loop with transient [N, d] tensors — the
+    same cost profile as the full operator's pair term.
+    """
+
+    MODES = ("direct",)
+
+    def __init__(
+        self,
+        num_factors: int,
+        num_relations: int,
+        dim: int,
+        mode: str = "direct",
+    ) -> None:
+        super().__init__()
+        assert mode in self.MODES, f"unknown direct mode {mode!r}"
+        self.mode = str(mode)
+        self.num_factors = int(num_factors)
+        self.num_relations = int(num_relations)
+        self.dim = int(dim)
+        self.D = nn.Parameter(torch.zeros(self.num_factors, self.num_relations, self.dim, self.dim))
+
+    def extra_residual_params(self) -> int:
+        return sum(int(p.numel()) for p in self.parameters())
+
+    def _cell_transform(self, x: torch.Tensor, f: int, k: int, w0: nn.Linear) -> torch.Tensor:
+        return w0(x) + x @ self.D[f, k].t()
+
+    def forward(
+        self,
+        g_perm: torch.Tensor,
+        gamma_graph: torch.Tensor,
+        w0: nn.Linear,
+    ) -> torch.Tensor:
+        """g_perm: [N, F, K, d]; gamma_graph: [N, F, K]. Returns m [N, F, d]."""
+        num_nodes, num_factors, num_relations, dim = g_perm.shape
+
+        agg = (gamma_graph.unsqueeze(-1) * g_perm).sum(dim=2)  # [N, F, d]
+        m = w0(agg.reshape(num_nodes * num_factors, dim)).reshape(num_nodes, num_factors, dim)
+
+        for f in range(num_factors):
+            for k in range(num_relations):
+                t = g_perm[:, f, k] @ self.D[f, k].t()  # [N, d]
+                m[:, f] = m[:, f] + gamma_graph[:, f, k : k + 1] * t
+        return m
+
+    # ------------------------------------------------------------------
+    # Regularization hooks (same interface as the other operators)
+    # ------------------------------------------------------------------
+
+    def reg_operator(self) -> torch.Tensor:
+        return self.D.square().sum()
+
+    def reg_interaction(self) -> torch.Tensor:
+        return torch.zeros((), dtype=torch.float32)
+
+    # ------------------------------------------------------------------
+    # Mechanism diagnostics (same interface; review-2 §10)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def compute_diagnostics(
+        self,
+        g_perm: torch.Tensor,
+        gamma_graph: torch.Tensor,
+        w0: nn.Linear,
+    ) -> dict:
+        num_nodes, num_factors, num_relations, dim = g_perm.shape
+        w0_norm = float(w0.weight.norm(p="fro").item())
+        t_cells = w0.weight.detach().clone().unsqueeze(0).unsqueeze(0).expand(
+            num_factors, num_relations, dim, dim
+        ).clone() + self.D.detach()
+
+        r_c_tensor = self.D.detach().norm(p="fro", dim=(2, 3)) / (w0_norm + _EPS)  # [F, K]
+        r_c = [[float(v) for v in row] for row in r_c_tensor.cpu().tolist()]
+        usage = gamma_graph.mean(dim=0)  # [F, K]
+        pair_strength = float((usage * r_c_tensor).sum().item())
+
+        def _pair_stats(mats: torch.Tensor) -> dict:
+            p = int(mats.size(0))
+            frob, cos = [], []
+            for i in range(p):
+                for j in range(i + 1, p):
+                    diff = (mats[i] - mats[j]).norm(p="fro")
+                    frob.append(float((diff / (mats[i].norm(p="fro") + mats[j].norm(p="fro") + _EPS)).item()))
+                    cos.append(float(torch.nn.functional.cosine_similarity(
+                        mats[i].flatten(), mats[j].flatten(), dim=0
+                    ).item()))
+            mean = lambda vals: sum(vals) / len(vals) if vals else 0.0  # noqa: E731
+            return {"norm_frob_dist": mean(frob), "flattened_cosine": mean(cos)}
+
+        same_relation = [_pair_stats(t_cells[:, k]) for k in range(num_relations)]
+        same_factor = [_pair_stats(t_cells[f]) for f in range(num_factors)]
+
+        delta_weighted_sum = 0.0
+        gamma_total = 0.0
+        for f in range(num_factors):
+            for k in range(num_relations):
+                g_cell = g_perm[:, f, k]
+                base = w0(g_cell)
+                trans = self._cell_transform(g_cell, f, k, w0)
+                delta = (trans - base).norm(dim=-1) / (base.norm(dim=-1) + _EPS)
+                w = gamma_graph[:, f, k]
+                delta_weighted_sum += float((w * delta).sum().item())
+                gamma_total += float(w.sum().item())
+
+        return {
+            "mode": self.mode,
             "w0_norm": w0_norm,
             "residual_norms": {
                 "factor": [],

@@ -67,7 +67,5 @@ p2:
 # --- P3 final operator: Full Cell-conditioned Operator (OFR) ---
 p3:
   operator_mode: full_interaction
-  lowrank_rank: 16
-  basis_num_bases: 8
   operator_reg_weight: 0.0
   interaction_reg_weight: 0.0

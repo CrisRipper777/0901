@@ -917,3 +917,136 @@ def test_biaxis_final_config_frozen_structure() -> None:
     assert isinstance(model, FinalModel)
     assert model.p3_operator_mode == "full_interaction"
     assert model.operator.mode == "full_interaction"
+
+
+def test_biaxis_final_config_has_no_unused_knobs() -> None:
+    """review-2 §18: the final config must not carry experiment knobs that
+    full_interaction never reads (lowrank_rank / basis_num_bases)."""
+    from hydra import compose, initialize
+
+    with initialize(config_path="../configs", version_base=None):
+        cfg = compose(config_name="config", overrides=["dataset=Movies", "task=nc", "model=biaxis_final"])
+    assert "lowrank_rank" not in cfg.model.p3
+    assert "basis_num_bases" not in cfg.model.p3
+
+
+# ===========================================================================
+# Basis per-basis Xavier init fix (review-2 §7-§9)
+# ===========================================================================
+
+
+def test_basis_per_basis_xavier_scale() -> None:
+    """Each V_b must be initialized as an independent [d, d] linear map:
+    bound sqrt(6/(d+d)) ~= 0.153 at d=128 (the old 3-D Xavier call gave
+    ~0.018, 8x too small)."""
+    d = 128
+    op = BasisCellOperator(F, K, d, num_bases=16)
+    bound = (6.0 / (d + d)) ** 0.5
+    assert float(op.V.abs().max().item()) > 0.9 * bound  # must be near the full bound
+    assert float(op.V.abs().max().item()) <= bound + 1e-6
+
+
+# ===========================================================================
+# Direct Cell Operator (review-2 §10-§12)
+# ===========================================================================
+
+from src.models.biaxis_p3_components import DirectCellOperator
+
+
+def _make_direct_op() -> DirectCellOperator:
+    return DirectCellOperator(F, K, D)
+
+
+def test_direct_zero_equivalence() -> None:
+    """D=0 -> T_fk = W0 exactly: bitwise == shared path."""
+    g_perm, gamma_graph, w0 = _rand_g(), _rand_gamma(), _make_w0()
+    reference = _shared_path(g_perm, gamma_graph, w0)
+    assert torch.equal(_make_direct_op()(g_perm, gamma_graph, w0), reference)
+
+
+def test_direct_param_count() -> None:
+    """F*K*d^2 = 196,608 at d=128 — 36.8% fewer residual params than OFR's
+    19*d^2, with the SAME effective function class (review-2 §12)."""
+    assert _make_direct_op().extra_residual_params() == F * K * D * D
+    assert DirectCellOperator(F, K, 128).extra_residual_params() == 196608
+    assert DirectCellOperator(F, K, 128).extra_residual_params() < 19 * 128 * 128
+
+
+def test_direct_formula() -> None:
+    op = _make_direct_op()
+    with torch.no_grad():
+        op.D.copy_(torch.randn(F, K, D, D))
+    g_perm, gamma_graph, w0 = _rand_g(), _rand_gamma(), _make_w0()
+    out = op(g_perm, gamma_graph, w0)
+    manual = _shared_path(g_perm, gamma_graph, w0)
+    for f in range(F):
+        for k in range(K):
+            manual[:, f] = manual[:, f] + gamma_graph[:, f, k : k + 1] * (g_perm[:, f, k] @ op.D[f, k].t())
+    assert torch.allclose(out, manual, atol=1e-5)
+
+
+def test_direct_same_function_class_as_ofr() -> None:
+    """review-2 §11: D_fk = A_f + B_k + C_fk. A full operator with
+    A/B/C set to a given D (A=B=0, C=D) must produce the SAME output as the
+    direct operator with that D."""
+    g_perm, gamma_graph, w0 = _rand_g(), _rand_gamma(), _make_w0()
+    d_target = torch.randn(F, K, D, D)
+    direct = _make_direct_op()
+    with torch.no_grad():
+        direct.D.copy_(d_target)
+    out_direct = direct(g_perm, gamma_graph, w0)
+
+    full = _make_op("full_interaction")
+    with torch.no_grad():
+        full.C.copy_(d_target)  # A=B=0, C=D
+    out_full = full(g_perm, gamma_graph, w0)
+    assert torch.allclose(out_direct, out_full, atol=1e-5)
+
+
+def test_direct_gradients() -> None:
+    op = _make_direct_op()
+    with torch.no_grad():
+        op.D.fill_(0.01)
+    g_perm = _rand_g().requires_grad_(True)
+    out = op(g_perm, _rand_gamma(), _make_w0())
+    out.square().sum().backward()
+    assert op.D.grad is not None and torch.isfinite(op.D.grad).all()
+    assert op.D.grad.norm() > 1e-9
+
+
+def test_direct_no_giant_tensor_on_large_batch() -> None:
+    big_n = 4096
+    generator = torch.Generator().manual_seed(9)
+    g_perm = torch.randn(big_n, F, K, D, generator=generator)
+    gamma_graph = torch.rand(big_n, F, K, generator=generator)
+    gamma_graph = gamma_graph / gamma_graph.sum(dim=-1, keepdim=True)
+    out = _make_direct_op()(g_perm, gamma_graph, _make_w0())
+    assert out.shape == (big_n, F, D)
+    assert torch.isfinite(out).all()
+
+
+def test_direct_diagnostics_and_interaction() -> None:
+    import json
+
+    g_perm, gamma_graph, w0 = _rand_g(), _rand_gamma(), _make_w0()
+    op = _make_direct_op()
+    with torch.no_grad():
+        op.D.fill_(0.05)
+    diag = op.compute_diagnostics(g_perm, gamma_graph, w0)
+    json.dumps(diag)
+    assert diag["extra_residual_params"] == F * K * D * D
+    assert diag["pair_strength"] >= 0
+    assert diag["interaction"]["usage_weighted_strength"] >= 0
+    # normalized average: raw strength divided by total usage (review-2 §2)
+    usage = gamma_graph.mean(dim=0)
+    expected_avg = diag["interaction"]["usage_weighted_strength"] / (usage.sum().item() + 1e-8)
+    assert abs(diag["interaction"]["usage_weighted_average"] - expected_avg) < 1e-6
+
+
+def test_p3_model_direct_mode_forward() -> None:
+    model = _make_p3_model("direct")
+    model.eval()
+    z, _, _, _, _ = model(_make_p3_x(), _make_p3_edge_index())
+    assert z.shape == (P3_NUM_NODES, P3_HIDDEN_DIM)
+    assert torch.isfinite(z).all()
+    assert model.operator.extra_residual_params() == 3 * 4 * P3_FACTOR_DIM * P3_FACTOR_DIM

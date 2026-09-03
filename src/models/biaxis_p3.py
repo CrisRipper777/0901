@@ -37,6 +37,7 @@ from .biaxis_p2_components import (
 )
 from .biaxis_p3_components import (
     BasisCellOperator,
+    DirectCellOperator,
     FullResidualFactorRelationOperator,
     LowRankFactorRelationOperator,
 )
@@ -90,6 +91,13 @@ class Model(P2Model):
                 num_relations=self.num_relations,
                 dim=self.factor_dim,
                 num_bases=int(p3.get("basis_num_bases", 8)),
+                mode=self.p3_operator_mode,
+            )
+        elif self.p3_operator_mode in DirectCellOperator.MODES:
+            self.operator = DirectCellOperator(
+                num_factors=3,
+                num_relations=self.num_relations,
+                dim=self.factor_dim,
                 mode=self.p3_operator_mode,
             )
         else:

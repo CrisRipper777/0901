@@ -60,12 +60,16 @@ p2:
 
 # --- P3 factor-relation operator (plan §30) ---
 p3:
-  # shared | factor | relation | additive | full_interaction
-  #   O0   |   OF   |    OR    |   OADD   |       OFR
+  # shared | factor | relation | additive | full_interaction | basis
+  #   O0   |   OF   |    OR    |   OADD   |       OFR        |  (review §20)
   operator_mode: shared
 
   # P3-B low-rank operator (implemented only after P3-A GO).
   lowrank_rank: 16
+
+  # Basis-decomposed cell operator (review §20): T_fk = W0 + sum_b c_fkb V_b.
+  # B=4/8/16 forms the capacity curve O0 -> B4 -> OADD -> B8 -> OFR.
+  basis_num_bases: 8
 
   # Residual regularizers: OFF in round 1 (plan §7; only global AdamW
   # weight decay applies).

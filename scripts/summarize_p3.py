@@ -44,6 +44,16 @@ LOWRANK_DELTAS = [
     ("LR-INT", "O0"),
     ("LR-ADD", "O0"),
 ]
+# review §20: the basis operator forms the capacity curve
+# O0 -> B4 (65.6K) -> OADD (115K) -> B8 (131.2K) -> B16 (262.3K) -> OFR (311K).
+BASIS_MODES = ["O0", "Basis4", "OADD", "Basis8", "Basis16", "OFR"]
+BASIS_DELTAS = [
+    ("Basis4", "O0"),
+    ("Basis8", "Basis4"),
+    ("Basis16", "Basis8"),
+    ("Basis8", "OADD"),
+    ("Basis16", "OFR"),
+]
 
 METRIC_LABELS = {
     "val_acc": "Val Acc",
@@ -326,9 +336,42 @@ def _write_lowrank_report(lowrank_summaries: list[dict], operator_summaries: lis
     (P3_ROOT / "lowrank" / "P3_LOWRANK_REPORT.md").write_text("\n".join(lines), encoding="utf-8")
 
 
+def _write_basis_report(basis_summaries: list[dict], operator_summaries: list[dict]) -> None:
+    grouped = _mode_groups(basis_summaries + operator_summaries)
+    lines: list[str] = []
+    lines.append("# P3 Basis Report — Basis-decomposed Cell Operator (review §20)")
+    lines.append("")
+    lines.append(
+        f"> Basis runs: {len(basis_summaries)} (5 datasets x B∈{{4,8,16}} x 3 seeds). "
+        f"O0/OADD/OFR references from P3-A (never re-run). T_fk = W0 + sum_b c_fkb V_b, "
+        f"full-matrix bases (Xavier) + per-cell coefficients (zero init). Extra params: "
+        f"B4 65.6K / B8 131.2K / B16 262.3K vs OADD 115K / OFR 311K / LR 4.2K."
+    )
+    lines.append("")
+
+    _report_tables(lines, grouped, BASIS_MODES)
+    _report_deltas(lines, grouped, BASIS_DELTAS, "val_acc", "Val Acc")
+    _report_deltas(lines, grouped, BASIS_DELTAS, "test_acc", "Test Acc")
+    _report_mechanism(lines, grouped, BASIS_MODES)
+
+    lines.append("## Review §20 question checklist (fill after analysis)")
+    lines.append("")
+    lines.append("Does the basis family recover the full-operator gains?")
+    lines.append("- [ ] Basis4 > O0 (matches/adds params at low cost)")
+    lines.append("- [ ] Basis8 >= OADD (same-params comparison, 115K vs 131K)")
+    lines.append("- [ ] Basis16 approaches OFR (262K vs 311K)")
+    lines.append("")
+    lines.append("If monotone recovery: P3-B failure = shared low-rank subspace too restrictive.")
+    lines.append("If flat ~O0: cell transformation genuinely needs the unconstrained full residual (capacity itself).")
+    lines.append("")
+    lines.append("- Decision: **PENDING** (fill after analysis)")
+    lines.append("")
+    (P3_ROOT / "basis" / "P3_BASIS_REPORT.md").write_text("\n".join(lines), encoding="utf-8")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="P3 aggregation + report")
-    parser.add_argument("--stage", default="operator", choices=["operator", "lowrank"])
+    parser.add_argument("--stage", default="operator", choices=["operator", "lowrank", "basis"])
     args = parser.parse_args()
     stage = args.stage
 
@@ -364,7 +407,7 @@ def main() -> None:
         _write_csv(stage_root / "p3_operator_deltas.csv", delta_rows)
         _write_operator_report(summaries)
         print(f"[summarize] {len(summaries)} runs -> {stage_root}", flush=True)
-    else:
+    elif stage == "lowrank":
         lowrank_summaries = _load_summaries(P3_ROOT / "lowrank")
         operator_summaries = _load_summaries(P3_ROOT / "operator")
         if not lowrank_summaries:
@@ -397,6 +440,39 @@ def main() -> None:
         _write_csv(stage_root / "p3_lowrank_deltas.csv", delta_rows)
         _write_lowrank_report(lowrank_summaries, operator_summaries)
         print(f"[summarize] {len(lowrank_summaries)} runs -> {stage_root}", flush=True)
+    else:
+        basis_summaries = _load_summaries(P3_ROOT / "basis")
+        operator_summaries = _load_summaries(P3_ROOT / "operator")
+        if not basis_summaries:
+            print("[summarize] no summary.json under outputs/p3/basis", flush=True)
+            return
+        stage_root = P3_ROOT / "basis"
+        stage_root.mkdir(parents=True, exist_ok=True)
+        _write_csv(stage_root / "p3_basis_results.csv", _results_rows(basis_summaries))
+        _write_csv(stage_root / "p3_basis_mechanism.csv", _mechanism_rows(basis_summaries))
+        grouped = _mode_groups(basis_summaries + operator_summaries)
+        delta_rows = []
+        for dataset in DATASETS:
+            for variant, reference in BASIS_DELTAS:
+                for metric_key in ("val_acc", "test_acc"):
+                    delta = _paired_delta(
+                        _seeded_values(grouped, dataset, variant, metric_key),
+                        _seeded_values(grouped, dataset, reference, metric_key),
+                    )
+                    if delta is None:
+                        continue
+                    delta_rows.append({
+                        "dataset": dataset,
+                        "comparison": f"{variant}-{reference}",
+                        "metric": metric_key,
+                        "mean_pp": f"{100 * delta['mean']:+.6f}",
+                        "std_pp": f"{100 * delta['std']:.6f}",
+                        "positive_seeds": delta["positive"],
+                        "n_seeds": delta["n"],
+                    })
+        _write_csv(stage_root / "p3_basis_deltas.csv", delta_rows)
+        _write_basis_report(basis_summaries, operator_summaries)
+        print(f"[summarize] {len(basis_summaries)} runs -> {stage_root}", flush=True)
 
 
 if __name__ == "__main__":

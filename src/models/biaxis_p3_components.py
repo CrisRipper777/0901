@@ -250,7 +250,32 @@ class FullResidualFactorRelationOperator(nn.Module):
             },
             "message_deviation_usage_weighted": message_deviation,
             "extra_residual_params": self.extra_residual_params(),
+            "interaction": _interaction_diagnostic(t_cells, w0_norm, usage),
         }
+
+
+def _interaction_diagnostic(
+    t_cells: torch.Tensor,
+    w0_norm: float,
+    usage: torch.Tensor,
+) -> dict:
+    """Double-centered interaction of the EFFECTIVE cell operators
+    (review §12):
+
+        I_fk = T_fk - Tbar_f· - Tbar_·k + Tbar_··
+
+    Defined on the final effective operators, invariant to how A/B/C absorb
+    each other (unlike ||C_fk||). Reports ||I_fk||_F / ||W0||_F per cell and
+    the usage-weighted strength sum_fk u_fk ||I_fk||_F / ||W0||_F."""
+    tbar_f = t_cells.mean(dim=1, keepdim=True)  # [F, 1, d, d]
+    tbar_k = t_cells.mean(dim=0, keepdim=True)  # [1, K, d, d]
+    tbar_all = t_cells.mean(dim=(0, 1), keepdim=True)  # [1, 1, d, d]
+    interaction = t_cells - tbar_f - tbar_k + tbar_all  # [F, K, d, d]
+    i_norms = interaction.norm(p="fro", dim=(2, 3)) / (w0_norm + _EPS)  # [F, K]
+    return {
+        "norms": [[float(v) for v in row] for row in i_norms.cpu().tolist()],
+        "usage_weighted_strength": float((usage * i_norms).sum().item()),
+    }
 
 
 class LowRankFactorRelationOperator(nn.Module):
@@ -438,4 +463,166 @@ class LowRankFactorRelationOperator(nn.Module):
                 delta_weighted_sum / (gamma_total + _EPS)
             ),
             "extra_residual_params": self.extra_residual_params(),
+            "interaction": _interaction_diagnostic(t_cells, w0_norm, usage),
+        }
+
+
+class BasisCellOperator(nn.Module):
+    """Basis-decomposed Cell Operator (review §20):
+
+        T_fk = W0 + sum_{b=1}^{B} c_fkb * V_b
+
+    with FULL-matrix basis V_b in R^{d x d} (Xavier) and per-cell
+    coefficients c in R^{F x K x B} (zeros). Unlike the low-rank operator
+    (shared rank-1 bases u_b v_b^T), each V_b is an arbitrary full-rank
+    matrix, so the parameter count scales as B*d^2 + F*K*B and interpolates
+    the capacity axis: O0 -> B4 (65.6K) -> OADD (115K) -> B8 (131.2K) ->
+    B16 (262.3K) -> OFR (311K).
+
+    Step 0: c=0 -> T_fk = W0 exactly (same zero-init discipline, plan §7).
+    c receives gradient immediately (through V_b x); V_b's residual
+    coefficient starts at 0 and activates once c != 0 (plan §18 dynamics,
+    expected).
+
+    Memory discipline: the cell operator matrices T_fk are materialized ONCE
+    per forward as [F, K, d, d] (786 KB at d=128 — no node dimension), then
+    applied per (f, k) cell with transient [N, d] tensors (same cost profile
+    as the full operator's pair term).
+    """
+
+    MODES = ("basis",)
+
+    def __init__(
+        self,
+        num_factors: int,
+        num_relations: int,
+        dim: int,
+        num_bases: int = 8,
+        mode: str = "basis",
+    ) -> None:
+        super().__init__()
+        assert mode in self.MODES, f"unknown basis mode {mode!r}"
+        self.mode = str(mode)
+        self.num_factors = int(num_factors)
+        self.num_relations = int(num_relations)
+        self.dim = int(dim)
+        self.num_bases = int(num_bases)
+
+        self.V = nn.Parameter(torch.empty(self.num_bases, self.dim, self.dim))
+        nn.init.xavier_uniform_(self.V)
+        self.c = nn.Parameter(torch.zeros(self.num_factors, self.num_relations, self.num_bases))
+
+    def extra_residual_params(self) -> int:
+        return sum(int(p.numel()) for p in self.parameters())
+
+    def _cell_residual(self) -> torch.Tensor:
+        """Effective per-cell residual matrices: [F, K, d, d] =
+        sum_b c_fkb * V_b (small, no node dimension)."""
+        return torch.einsum("bde,fkb->fkde", self.V, self.c)
+
+    def _cell_transform(self, x: torch.Tensor, f: int, k: int, w0: nn.Linear) -> torch.Tensor:
+        out = w0(x)
+        resid = torch.einsum("bde,b->de", self.V, self.c[f, k])
+        return out + x @ resid.t()
+
+    def forward(
+        self,
+        g_perm: torch.Tensor,
+        gamma_graph: torch.Tensor,
+        w0: nn.Linear,
+    ) -> torch.Tensor:
+        """g_perm: [N, F, K, d]; gamma_graph: [N, F, K]. Returns m [N, F, d]."""
+        num_nodes, num_factors, num_relations, dim = g_perm.shape
+
+        agg = (gamma_graph.unsqueeze(-1) * g_perm).sum(dim=2)  # [N, F, d]
+        m = w0(agg.reshape(num_nodes * num_factors, dim)).reshape(num_nodes, num_factors, dim)
+
+        resid = self._cell_residual()  # [F, K, d, d], materialized once
+        for f in range(num_factors):
+            for k in range(num_relations):
+                t = g_perm[:, f, k] @ resid[f, k].t()  # [N, d]
+                m[:, f] = m[:, f] + gamma_graph[:, f, k : k + 1] * t
+        return m
+
+    # ------------------------------------------------------------------
+    # Regularization hooks (same interface as the other operators)
+    # ------------------------------------------------------------------
+
+    def reg_operator(self) -> torch.Tensor:
+        return self.c.square().sum()
+
+    def reg_interaction(self) -> torch.Tensor:
+        return torch.zeros((), dtype=torch.float32)
+
+    # ------------------------------------------------------------------
+    # Mechanism diagnostics (same interface; review §20)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def compute_diagnostics(
+        self,
+        g_perm: torch.Tensor,
+        gamma_graph: torch.Tensor,
+        w0: nn.Linear,
+    ) -> dict:
+        num_nodes, num_factors, num_relations, dim = g_perm.shape
+        w0_norm = float(w0.weight.norm(p="fro").item())
+        resid = self._cell_residual()  # [F, K, d, d]
+        t_cells = w0.weight.detach().clone().unsqueeze(0).unsqueeze(0).expand(
+            num_factors, num_relations, dim, dim
+        ).clone() + resid
+
+        r_c_tensor = resid.norm(p="fro", dim=(2, 3)) / (w0_norm + _EPS)  # [F, K]
+        r_c = [[float(v) for v in row] for row in r_c_tensor.cpu().tolist()]
+        usage = gamma_graph.mean(dim=0)  # [F, K]
+        pair_strength = float((usage * r_c_tensor).sum().item())
+
+        def _pair_stats(mats: torch.Tensor) -> dict:
+            p = int(mats.size(0))
+            frob, cos = [], []
+            for i in range(p):
+                for j in range(i + 1, p):
+                    diff = (mats[i] - mats[j]).norm(p="fro")
+                    frob.append(float((diff / (mats[i].norm(p="fro") + mats[j].norm(p="fro") + _EPS)).item()))
+                    cos.append(float(torch.nn.functional.cosine_similarity(
+                        mats[i].flatten(), mats[j].flatten(), dim=0
+                    ).item()))
+            mean = lambda vals: sum(vals) / len(vals) if vals else 0.0  # noqa: E731
+            return {"norm_frob_dist": mean(frob), "flattened_cosine": mean(cos)}
+
+        same_relation = [_pair_stats(t_cells[:, k]) for k in range(num_relations)]
+        same_factor = [_pair_stats(t_cells[f]) for f in range(num_factors)]
+
+        delta_weighted_sum = 0.0
+        gamma_total = 0.0
+        for f in range(num_factors):
+            for k in range(num_relations):
+                g_cell = g_perm[:, f, k]
+                base = w0(g_cell)
+                trans = self._cell_transform(g_cell, f, k, w0)
+                delta = (trans - base).norm(dim=-1) / (base.norm(dim=-1) + _EPS)
+                w = gamma_graph[:, f, k]
+                delta_weighted_sum += float((w * delta).sum().item())
+                gamma_total += float(w.sum().item())
+
+        return {
+            "mode": self.mode,
+            "num_bases": self.num_bases,
+            "w0_norm": w0_norm,
+            "residual_norms": {
+                "factor": [],
+                "relation": [],
+                "pair": r_c,
+            },
+            "usage": usage.cpu().tolist(),
+            "pair_strength": pair_strength,
+            "operator_distance": {
+                "same_relation_across_factors": same_relation,
+                "same_factor_across_relations": same_factor,
+            },
+            "message_deviation_usage_weighted": float(
+                delta_weighted_sum / (gamma_total + _EPS)
+            ),
+            "extra_residual_params": self.extra_residual_params(),
+            "interaction": _interaction_diagnostic(t_cells, w0_norm, usage),
         }

@@ -36,6 +36,7 @@ from .biaxis_p2_components import (
     semi_relaxed_transport,
 )
 from .biaxis_p3_components import (
+    BasisCellOperator,
     FullResidualFactorRelationOperator,
     LowRankFactorRelationOperator,
 )
@@ -81,6 +82,14 @@ class Model(P2Model):
                 num_relations=self.num_relations,
                 dim=self.factor_dim,
                 rank=self.p3_lowrank_rank,
+                mode=self.p3_operator_mode,
+            )
+        elif self.p3_operator_mode in BasisCellOperator.MODES:
+            self.operator = BasisCellOperator(
+                num_factors=3,
+                num_relations=self.num_relations,
+                dim=self.factor_dim,
+                num_bases=int(p3.get("basis_num_bases", 8)),
                 mode=self.p3_operator_mode,
             )
         else:

@@ -767,3 +767,153 @@ def test_lr_diagnostics_device_safe_on_gpu() -> None:
     diag = op.compute_diagnostics(g_perm, gamma_graph, w0)
     assert diag["pair_strength"] >= 0
     assert diag["w0_norm"] > 0
+
+
+def test_lr_interaction_diagnostic_zero_for_additive() -> None:
+    """review §12: for the additive form the effective operators decompose
+    as T_fk = W0 + A_f + B_k, whose double-centered interaction is EXACTLY
+    zero. The low-rank ADD/INT operators only differ via a*b: with a,b
+    nonzero the interaction diagnostic must be nonzero and nonnegative."""
+    g_perm, gamma_graph, w0 = _rand_g(), _rand_gamma(), _make_w0()
+    for mode in LowRankFactorRelationOperator.MODES:
+        op = _make_lr_op(mode)
+        diag = op.compute_diagnostics(g_perm, gamma_graph, w0)
+        assert diag["interaction"]["usage_weighted_strength"] >= 0
+        assert len(diag["interaction"]["norms"]) == F
+    # a=b=0 -> T_fk identical -> interaction zero up to float-mean ulp noise
+    # (the double centering divides by F/K then re-adds; 3M/3 != M exactly).
+    op = _make_lr_op("lowrank_interaction")
+    diag = op.compute_diagnostics(g_perm, gamma_graph, _make_w0())
+    assert diag["interaction"]["usage_weighted_strength"] < 1e-6
+
+
+# ===========================================================================
+# Basis-decomposed cell operator (review §20)
+# ===========================================================================
+
+from src.models.biaxis_p3_components import BasisCellOperator
+
+BASIS_B = 4
+
+
+def _make_basis_op(num_bases: int = BASIS_B) -> BasisCellOperator:
+    return BasisCellOperator(F, K, D, num_bases=num_bases)
+
+
+def test_basis_zero_equivalence() -> None:
+    """c=0 -> T_fk = W0 for every cell: output bitwise == shared path."""
+    g_perm, gamma_graph, w0 = _rand_g(), _rand_gamma(), _make_w0()
+    reference = _shared_path(g_perm, gamma_graph, w0)
+    assert torch.equal(_make_basis_op()(g_perm, gamma_graph, w0), reference)
+
+
+def test_basis_param_counts() -> None:
+    """B*d^2 + F*K*B (review §20)."""
+    assert _make_basis_op(4).extra_residual_params() == 4 * D * D + F * K * 4
+    assert _make_basis_op(8).extra_residual_params() == 8 * D * D + F * K * 8
+    assert _make_basis_op(16).extra_residual_params() == 16 * D * D + F * K * 16
+    # capacity-curve values at d=128 (review §20): 65.6K / 131.2K / 262.3K
+    assert BasisCellOperator(F, K, 128, num_bases=4).extra_residual_params() == 65584
+    assert BasisCellOperator(F, K, 128, num_bases=8).extra_residual_params() == 131168
+    assert BasisCellOperator(F, K, 128, num_bases=16).extra_residual_params() == 262336
+
+
+def test_basis_formula() -> None:
+    """T_fk = W0 + sum_b c_fkb * V_b, matched against a manual reference."""
+    op = _make_basis_op()
+    with torch.no_grad():
+        op.c.copy_(torch.randn(F, K, BASIS_B))
+        op.V.copy_(torch.randn(BASIS_B, D, D))
+    g_perm, gamma_graph, w0 = _rand_g(), _rand_gamma(), _make_w0()
+    out = op(g_perm, gamma_graph, w0)
+    manual = _shared_path(g_perm, gamma_graph, w0)
+    resid = torch.einsum("bde,fkb->fkde", op.V, op.c)
+    for f in range(F):
+        for k in range(K):
+            manual[:, f] = manual[:, f] + gamma_graph[:, f, k : k + 1] * (g_perm[:, f, k] @ resid[f, k].t())
+    assert torch.allclose(out, manual, atol=1e-5)
+
+
+def test_basis_gradients_with_active_coefficients() -> None:
+    op = _make_basis_op()
+    with torch.no_grad():
+        op.c.fill_(0.1)
+    g_perm = _rand_g().requires_grad_(True)
+    out = op(g_perm, _rand_gamma(), _make_w0())
+    out.square().sum().backward()
+    assert op.V.grad is not None and torch.isfinite(op.V.grad).all() and op.V.grad.norm() > 1e-9
+    assert op.c.grad is not None and torch.isfinite(op.c.grad).all() and op.c.grad.norm() > 1e-9
+
+
+def test_basis_zero_init_gradient_expectations() -> None:
+    """Same plan-§18 dynamics as the low-rank operator: c receives gradient
+    immediately (through V_b x), V_b starts with an exactly-zero residual
+    coefficient."""
+    op = _make_basis_op()
+    g_perm = _rand_g().requires_grad_(True)
+    out = op(g_perm, _rand_gamma(), _make_w0())
+    out.square().sum().backward()
+    assert op.c.grad is not None and op.c.grad.norm() > 1e-9
+    assert torch.equal(op.V.grad, torch.zeros(BASIS_B, D, D))
+
+
+def test_basis_no_giant_tensor_on_large_batch() -> None:
+    big_n = 4096
+    generator = torch.Generator().manual_seed(9)
+    g_perm = torch.randn(big_n, F, K, D, generator=generator)
+    gamma_graph = torch.rand(big_n, F, K, generator=generator)
+    gamma_graph = gamma_graph / gamma_graph.sum(dim=-1, keepdim=True)
+    out = _make_basis_op()(g_perm, gamma_graph, _make_w0())
+    assert out.shape == (big_n, F, D)
+    assert torch.isfinite(out).all()
+
+
+def test_basis_diagnostics_json_safe() -> None:
+    import json
+
+    g_perm, gamma_graph, w0 = _rand_g(), _rand_gamma(), _make_w0()
+    op = _make_basis_op()
+    with torch.no_grad():
+        op.c.fill_(0.05)
+    diag = op.compute_diagnostics(g_perm, gamma_graph, w0)
+    json.dumps(diag)
+    assert diag["num_bases"] == BASIS_B
+    assert diag["extra_residual_params"] == BASIS_B * D * D + F * K * BASIS_B
+    assert diag["pair_strength"] >= 0
+    assert diag["interaction"]["usage_weighted_strength"] >= 0
+
+
+def test_p3_model_basis_modes_forward() -> None:
+    for num_bases in (4, 8, 16):
+        cfg = _make_p3_cfg("basis")
+        cfg.model.p3.basis_num_bases = num_bases
+        model = P3Model(cfg, _make_p3_data_info())
+        model.eval()
+        z, _, _, _, _ = model(_make_p3_x(), _make_p3_edge_index())
+        assert z.shape == (P3_NUM_NODES, P3_HIDDEN_DIM)
+        assert torch.isfinite(z).all()
+        expected_extra = num_bases * P3_FACTOR_DIM * P3_FACTOR_DIM + 3 * 4 * num_bases
+        assert model.operator.extra_residual_params() == expected_extra
+
+
+def test_biaxis_final_config_frozen_structure() -> None:
+    """review §18: model=biaxis_final must resolve to the frozen final
+    operator (full_interaction + null_softmax + deterministic=false) and the
+    factory import path must exist."""
+    from hydra import compose, initialize
+
+    with initialize(config_path="../configs", version_base=None):
+        cfg = compose(config_name="config", overrides=["dataset=Movies", "task=nc", "model=biaxis_final"])
+    assert cfg.model.p2.mode == "null_softmax"
+    assert cfg.model.p2.deterministic is False
+    assert cfg.model.p3.operator_mode == "full_interaction"
+    assert cfg.model.p3.operator_reg_weight == 0.0
+    assert cfg.model.p3.interaction_reg_weight == 0.0
+
+    from src.models.factory import build_model
+    from src.models.biaxis_final import Model as FinalModel
+
+    model = build_model(cfg, _make_p3_data_info())
+    assert isinstance(model, FinalModel)
+    assert model.p3_operator_mode == "full_interaction"
+    assert model.operator.mode == "full_interaction"

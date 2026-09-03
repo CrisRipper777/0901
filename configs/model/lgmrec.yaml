@@ -1,0 +1,21 @@
+name: lgmrec
+
+# LGMRec (RecSys 2024), ported from OpenMAG (OpenMAG/configs/model/lgmrec.yaml
+# + src/model/models.py). Hypergraph-enhanced LightGCN with multimodal
+# InfoNCE reconstruction aux losses (OpenMAG NC trainer: lambda 0.5/0.5,
+# tau 0.07). lr/wd preset from OpenMAG NC task config.
+hidden_dim: 128
+num_layers: 3
+dropout: 0.2
+hyper_num: 64
+alpha: 0.1
+
+# OpenMAG NC preset (official).
+lr: 5e-3
+weight_decay: 1e-5
+
+# Aux InfoNCE (adapted to full-graph training: random node subset per epoch).
+nce_batch_size: 1024
+nce_tau: 0.07
+lambda_v: 0.5
+lambda_t: 0.5

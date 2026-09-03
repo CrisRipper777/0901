@@ -26,13 +26,15 @@
 
 ### 数据集实际规模（框架 loader 实测，2026-09-03）
 
-| dataset | N | E（无向+双向，预处理后） | x dim | g_perm [N,F,K,d] |
+| dataset | N | E（无向+双向，预处理后） | x dim | g_perm [N,F,K,d]（f32 = N×3×4×128×4B） |
 |---|---:|---:|---:|---:|
-| Movies | 16,672 | 160,802 | 1536 | 328 MB |
-| Toys | 20,695 | 113,402 | 1536 | 407 MB |
-| Grocery | 17,074 | 142,262 | 1536 | 336 MB |
-| Reddit-S | 15,894 | 283,080 | 1536 | 312 MB |
-| ele-fashion | 97,766 | 399,172 | 1024 | **1.92 GB**（f32，含 permute 后视图） |
+| Movies | 16,672 | 160,802 | 1536 | 102 MB |
+| Toys | 20,695 | 113,402 | 1536 | 127 MB |
+| Grocery | 17,074 | 142,262 | 1536 | 105 MB |
+| Reddit-S | 15,894 | 283,080 | 1536 | 98 MB |
+| ele-fashion | 97,766 | 399,172 | 1024 | **601 MB（573 MiB）** |
+
+（修订注 2026-09-03：初版该列数值错误——按元素数×4B 复核，ele-fashion = 97,766×3×4×128×4 = 600.7 MB，其余四行同步纠正。）
 
 **重要发现 A**：当前 `edge_chunk_size=500000`，而 5 个数据集中最大 E = ele-fashion 399,172 < 500,000 → **现有 NC 协议下分块分支从未真正触发**。ele-fashion 的显存压力来自节点侧张量（g_perm ≈ 600 MB 实际存储 + `f_cat[src]` 全量 gather `[E,384]` ≈ 613 MB 瞬态），而非边分块。R1-A 的 reliability 路径仍**必须实现分块**（纪律 + 未来更大图），但可以给 reliability 单独一个更小的 chunk（如 200K），把 ele-fashion 的 token 瞬态从 ~155 MB 压到 ~78 MB。
 
@@ -65,7 +67,7 @@ biaxis_perf_r1.Model(P3Model)        # 与 biaxis_ablation.Model 完全同款模
 等价测试（`tests/test_biaxis_perf_r1.py`）：
 - 用同一 `data_info` + 同一 cfg 构建 `biaxis_final.Model` 与 `biaxis_perf_r1.Model(mode=baseline)`，把前者 state_dict 载入两者，随机输入 forward → `torch.equal(z)`。
 - 训练一步后（或随机 step 后）再次断言 bitwise 相等（排除只在 step-0 成立的假等价）。
-- `semantic_reliability` 模式 fresh 模型（η zero-init）与 baseline 输出 bitwise 相等（η≡1 严格成立时的推论，见 Q7）。
+- `semantic_reliability` 模式 fresh 模型（η zero-init）与 baseline 输出**数学等价**（η≡1 严格成立，见 Q7）；但两路聚合的 index_add 分组顺序不同 → 断言用 `allclose`，**不得用 `torch.equal`**（见 §3 M3 与 §4 风险点 1）。
 
 ### Q3. R1-A reliability 应插入 `relation_weighted_mean` 的哪个位置？
 
@@ -84,8 +86,7 @@ g_perm = g_cat.reshape(...).permute(0, 2, 1, 3)
 # R1-A1：r_str 不变、availability 不变，只有 context 聚合带 η
 g_perm, effective_mass = reliable_relation_weighted_mean(
     edge_index, r, f_block, self.reliability, num_nodes,
-    edge_chunk_size=self.edge_chunk_size,
-    rel_chunk_size=self.r1_rel_chunk_size,
+    edge_chunk_size=self.r1_rel_chunk_size,
 )   # g_perm [N,F,K,d]，effective_mass_ifk = Σ_j r_ji,k η_ji^f
 ```
 
@@ -151,7 +152,7 @@ nn.init.zeros_(self.mlp[-1].bias)
 eta = 2.0 * torch.sigmoid(delta)     # delta≡0 ⇒ eta≡1.0
 ```
 
-- f32 下 `sigmoid(0)=0.5` 精确可表示 → `2*0.5=1.0` **精确等于 1** → fresh A1 模型与 baseline 输出 bitwise 相同（Q2 测试 3）。
+- f32 下 `sigmoid(0)=0.5` 精确可表示 → `2*0.5=1.0` **精确等于 1**（η 本身可用 `torch.equal` 断言，见 T1）。但 g 的聚合顺序不同（chunk×f×k vs 全量×k），fresh A1 与 baseline 的**输出**只保证数学等价：`Σ r·η·f / Σ r·η` 在 η≡1 时与 `Σ r·f / Σ r` 精确算术相等，浮点舍入随累加分组而异 → 断言 `allclose`（§3 M3）。
 - η∈(0,2) 由 `2σ(·)` 保证（σ∈(0,1) 严格开区间）。
 - 投影 `P_f: 128→32` **bias=True**（防止 f 落在核空间时 u=0 导致 cosine 退化）；cosine 项分母 `‖u_i‖‖u_j‖+eps`，双零向量时定义 cos=0（clamp）。
 - 梯度动力学注意：step-0 只有最后一层有非零梯度（hidden 激活非零）；P_f 与 hidden 层梯度在 step-0 精确为 0、在最后一层移动一步后激活——与 LowRank U/V 的注释相同（`biaxis_p3_components.py:307-311`），**预期行为，不是 bug**；梯度测试要按两步设计。
@@ -201,6 +202,22 @@ gamma = null_augmented_softmax(s_aug, eps)                      # 之后全部�
 
 ---
 
+## 1bis. A1 能力边界与 NO-GO 解释纪律（审查补充，2026-09-03）
+
+设计上 η_ji^f **与 relation k 无关**：同一条边对 factor f 的可靠性会同时乘到 R1..RK 的全部 context。
+
+- A1 能回答：**这个邻居对 C/Pt/Pv 是否值得信任？**（Factor-conditioned Edge Reliability）
+- A1 **不能**回答："这个邻居对 C 应更像 R1、对 Pv 应更像 R3" —— 那是 A2（Factor-conditioned Relation Interpretation，计划 §14-§16）的能力。
+
+这是刻意分层，不是缺陷。由此确立实验解读纪律：
+
+1. 若 A1 GO → factor-specific scalar neighbor reliability 足以改善 context 质量。
+2. 若 A1 NO-GO → **只能**得出 "factor-specific scalar neighbor reliability 不足以修复现有 structural relation/context"，**不能**得出 "semantic-aware relation 没用"；A2 仍是合理的下一项诊断（按计划 §14 触发条件判断）。
+3. A1 与 A2 的开关必须独立（计划 §41：第一轮不要二者同时训练）。
+4. 诊断解读同受此边界约束：D_ctx / Δ_relctx / Δg 的改善只能归因于 scalar reliability，不能归因于 relation 重新解释。
+
+---
+
 ## 2. 代码文件计划
 
 ```text
@@ -223,9 +240,10 @@ class FactorConditionedEdgeReliability(nn.Module):
     η = 2σ(δ)；最后一层 zero-init。forward(f_src_c, f_dst_c) -> η [C, F]。"""
 
 def reliable_relation_weighted_mean(edge_index, r, f_block, reliability, num_nodes,
-                                    edge_chunk_size=None, rel_chunk_size=None,
+                                    edge_chunk_size=None,
                                     ) -> tuple[torch.Tensor, torch.Tensor]:
-    """-> (g_perm [N,F,K,d], effective_mass [N,F,K])。chunk×factor×relation 循环，见 §1 Q4/Q5。"""
+    """-> (g_perm [N,F,K,d], effective_mass [N,F,K])。单 chunk 参数（模型传 r1_rel_chunk_size，
+    η 计算与聚合共用同一边分块循环），chunk×factor×relation 循环，见 §1 Q4/Q5。"""
 ```
 
 模型侧：
@@ -246,9 +264,20 @@ class Model(P3Model):
     @torch.no_grad()
     def compute_r1_diagnostics(self, x, edge_index) -> dict:
         # P3 diagnostics + η mean/std/p10/p50/p90、frac<0.5、frac>1.5（per factor）
+        # + CV_η^f = std(η^f)/mean(η^f)（global，审查补充 §八：weighted mean 对统一缩放
+        #   不敏感，真正信号是相对分化）
+        # + neighbor-wise η std / CV（审查补充 §八）：按节点邻域内 std_{j∈N(i)} η_ji^f
+        #   （分块 index_add 累加 Ση/Ση² 后逐节点计算，deg>0 mask），报告节点间均值
         # + corr(η, semantic cosine)（分块）+ effective_mass 统计
+        # + context_change Δg_ifk = 1 − cos(g^A1, g^A0)（审查补充 §九）：
+        #   g^A1 = 本次 _graph_update 的 graph_out["g_perm"]；
+        #   g^A0 = frozen relation_weighted_mean 按同一 f_block 重算（η≡1 基准），
+        #   按 factor × relation 汇总 mean/max。机制区分：
+        #   η 有方差但 Δg≈0 → 学了但没改变 context；
+        #   Δg 明显但 Val 不升 → 改变了 context 但改错了。
         # + D_ctx（R0 同定义，mask 用 structural mass≥0.5 保持可比）
         # + weighted semantic coherence（r·η 加权 Sim_{f,k}）
+        # baseline 模式无 reliability 模块 → η/CV/neighbor/Δg 段返回 null，其余照常。
 ```
 
 分析层（`perf_r1_utils.py`）关键差异 vs `perf_r0_utils`：
@@ -296,14 +325,14 @@ outputs/perf_r1/
 
 | # | 测试 | 断言 |
 |---|---|---|
-| M1 | baseline same-weights | `biaxis_final.Model` 与 `biaxis_perf_r1(mode=baseline)` 载入同一 state_dict，同输入 `torch.equal(z)`（含随机 step 后复测） |
+| M1 | baseline same-weights | `biaxis_final.Model` 与 `biaxis_perf_r1(mode=baseline)` 载入同一 state_dict，同输入 `torch.equal(z)`（含随机 step 后复测）——**唯一允许 bitwise 的等价断言**（完全相同的 `super()._graph_update` 代码路径） |
 | M2 | baseline state_dict keys | 与 biaxis_final keys 完全一致（baseline 不构造新模块的直接后果） |
-| M3 | A1 zero-init 等价 | fresh `semantic_reliability` 与 fresh baseline 输出 `torch.equal` |
+| M3 | A1 zero-init 数值等价 | fresh `semantic_reliability` 与 fresh baseline 输出 `allclose(rtol=1e-5, atol=1e-6)`（η≡1 精确成立，但 index_add 分组与浮点累加顺序不同 → 数学等价、非 bitwise） |
 | M4 | mode 校验 | 未知 mode raise；semantic_reliability 下 reliability 模块存在 |
 | M5 | inference 等价 | `inference(x, ei)` == eval-mode `forward`（CPU 路径） |
 | M6 | A1 梯度 | 训练模式 forward+backward 全部 finite；η 相关参数进入 optimizer 参数集 |
 | M7 | 隔离节点 | 全隔离图上 A1 forward 无 NaN、gamma 行和=1 |
-| M8 | 诊断键 | `compute_r1_diagnostics` 返回键齐全且 JSON-safe（η stats/D_ctx/effective_mass/weighted coherence + P3 原有键） |
+| M8 | 诊断键 | `compute_r1_diagnostics` 返回键齐全且 JSON-safe：η stats（含 CV_η 与 neighbor-wise std/CV）、context_change Δg、D_ctx、effective_mass、weighted coherence + P3 原有键；baseline 模式 η 相关段为 null |
 
 计数预估：组件 ~8 + 模型 ~8 ≈ 16 个新测试，全部 CPU 可跑（GPU 守卫照 P3 惯例）。
 
@@ -322,7 +351,9 @@ outputs/perf_r1/
 
 风险点清单：
 
-1. **chunk 累加顺序**：reliable 聚合顺序与 P1 不同 → 任何"等价"断言必须 allclose 而非 equal；但 A1-vs-baseline 的 fresh 等价是 η≡1 的乘法精确性 + 相同实现路径，仍可 equal。
+1. **chunk 累加顺序（两类等价纪律，审查修订）**：
+   - A0-baseline vs `biaxis_final`：完全相同的 `super()._graph_update` 代码路径 → `torch.equal`（M1）。
+   - A1 vs A0（fresh，η≡1）：η=1 保证的是**数学等价**（分子分母同除 η），`index_add_` 分组与浮点累加顺序不同 → 一律 `allclose(rtol=1e-5, atol=1e-6)`（M3），**任何地方不得用 equal 断言 A1-A0 等价**。
 2. **dtype**：η 与 r 保持 f32；不要引入 double 到聚合主路径（诊断侧可用 f64 累加，照 R0 惯例）。
 3. **R1-C 公式外层 LN 与 zero-init 等价冲突**（预先标记，R1-C 阶段定稿）：计划 §26 `F^out = LN(F(1) + λ W(F(2)-F(1)))`，λ=0 时 `F^out = LN(F(1)) ≠ F(1)` —— 违反 §34 测试 1 "depth gate zero-init => parent 1-hop output"。建议二选一：(a) 去掉外层 LN（F(1) 已过 graph_norm）；(b) LN 移到残差路径 `F^out = F(1) + λ·LN(W(F(2)-F(1)))`。推荐 (b)，保留归一化且严格满足 λ=0 等价。**在 R1-C 开工前与审查方确认**。
 4. **g_bar 缺失**（Q9）：R1-B 前需在 R1 的 `_graph_update` 里补 `neighbor_mean`，不要在 frozen P1 文件里动。

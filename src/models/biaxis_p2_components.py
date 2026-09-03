@@ -298,8 +298,9 @@ def deterministic_relation_weighted_mean(
         src_c, dst_c = src[start:end], dst[start:end]
         r_c = r[start:end]
         mass += _csr_chunk_aggregate(dst_c, r_c, num_nodes)  # [N, K]
+        features_src_c = features[src_c]  # hoisted per chunk (memory fix)
         for rel in range(k):
-            weighted = r_c[:, rel].unsqueeze(-1) * features[src_c]  # [E_c, d]
+            weighted = r_c[:, rel].unsqueeze(-1) * features_src_c  # [E_c, d]
             acc[:, rel] += _csr_chunk_aggregate(dst_c, weighted, num_nodes)
     g = acc / (mass.unsqueeze(-1) + _EPS)
     return g, mass

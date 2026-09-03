@@ -209,16 +209,22 @@ def relation_weighted_mean(
     acc = torch.zeros(num_nodes, k, dim, dtype=dtype, device=features.device)
 
     if edge_chunk_size is None or edge_chunk_size >= num_edges:
+        # Memory fix (2026-09-04): hoist the [E, d] source-feature gather OUT
+        # of the relation loop — one gather shared by all K relations instead
+        # of K identical gathers (bitwise identical values; the four
+        # r-scaled products still exist and are what autograd retains).
+        features_src = features[src]  # [E, d]
         for rel in range(k):
-            weighted = r[:, rel].unsqueeze(-1) * features[src]  # [E, d]
+            weighted = r[:, rel].unsqueeze(-1) * features_src  # [E, d]
             acc[:, rel].index_add_(0, dst, weighted)
     else:
         for start in range(0, num_edges, int(edge_chunk_size)):
             end = min(start + int(edge_chunk_size), num_edges)
             src_c, dst_c = src[start:end], dst[start:end]
             r_c = r[start:end]
+            features_src_c = features[src_c]  # hoisted per chunk
             for rel in range(k):
-                weighted = r_c[:, rel].unsqueeze(-1) * features[src_c]  # [chunk, d]
+                weighted = r_c[:, rel].unsqueeze(-1) * features_src_c  # [chunk, d]
                 acc[:, rel].index_add_(0, dst_c, weighted)
     g = acc / (mass.unsqueeze(-1) + _EPS)  # [N, K, d]
     return g, mass

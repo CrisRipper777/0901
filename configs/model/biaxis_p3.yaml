@@ -75,3 +75,7 @@ p3:
   # weight decay applies).
   operator_reg_weight: 0.0
   interaction_reg_weight: 0.0
+
+  # Memory fix (2026-09-04, user-authorized): activation checkpointing for
+  # the context+scorer segment. Numerics-preserving; see biaxis_final.yaml.
+  memory_checkpoint: true

@@ -69,3 +69,7 @@ p3:
   operator_mode: full_interaction
   operator_reg_weight: 0.0
   interaction_reg_weight: 0.0
+  # Memory fix (2026-09-04, user-authorized): activation checkpointing for
+  # the context+scorer segment. Numerics-preserving (recomputation is
+  # bitwise identical); training peak on ele-fashion drops ~16.4GB -> ~11GB.
+  memory_checkpoint: true

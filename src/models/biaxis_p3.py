@@ -24,9 +24,24 @@ P3 discipline:
 
 from __future__ import annotations
 
+import warnings
+
 import torch
+import torch.utils.checkpoint
 
 from .biaxis_p1_components import relation_weighted_mean
+
+# torch 2.4's non-reentrant checkpoint internally calls the deprecated
+# torch.cpu.amp.autocast(...) constructor (checkpoint.py:~1399) on every
+# invocation; the kwargs are empty unless CPU autocast is enabled (we never
+# enable it), so the FutureWarning is purely cosmetic. Silencing it here,
+# scoped to torch.utils.checkpoint, keeps training logs clean.
+warnings.filterwarnings(
+    "ignore",
+    message=".*torch.cpu.amp.autocast.*deprecated.*",
+    category=FutureWarning,
+    module=r"torch\.utils\.checkpoint",
+)
 from .biaxis_p2 import Model as P2Model
 from .biaxis_p2_components import (
     build_augmented_scores,
@@ -69,6 +84,11 @@ class Model(P2Model):
         self.p3_lowrank_rank = int(p3.get("lowrank_rank", 16))
         self.p3_operator_reg_weight = float(p3.get("operator_reg_weight", 0.0))
         self.p3_interaction_reg_weight = float(p3.get("interaction_reg_weight", 0.0))
+        # Memory fix (2026-09-04): activation checkpointing for the context +
+        # scorer segment. Numerics-preserving: the recomputed activations are
+        # bitwise identical to the forward pass (no dropout / randomness in
+        # the segment), so gradients and results are unchanged.
+        self.p3_memory_checkpoint = bool(p3.get("memory_checkpoint", False))
 
         if self.p3_operator_mode in FullResidualFactorRelationOperator.MODES:
             self.operator = FullResidualFactorRelationOperator(
@@ -121,16 +141,35 @@ class Model(P2Model):
 
         r, availability, deg = self._decompose_relations(edge_index, num_nodes)
 
-        # Relation-specific factor contexts (P1 aggregation, P2 plan §5).
+        # Relation-specific factor contexts (P1 aggregation, P2 plan §5) +
+        # relation compatibility scores (plan §6). With memory_checkpoint the
+        # whole context+scorer segment runs under activation checkpointing:
+        # its [E, d]-level intermediates are recomputed in backward instead
+        # of retained (bitwise-identical recomputation: no dropout or
+        # randomness inside the segment).
         f_cat = f_block.reshape(num_nodes, num_factors * factor_dim)
-        g_cat, _mass = relation_weighted_mean(
-            edge_index, r, f_cat, num_nodes, edge_chunk_size=self.edge_chunk_size
-        )  # [N, K, F*d]
-        g_perm = g_cat.reshape(num_nodes, self.num_relations, num_factors, factor_dim)
-        g_perm = g_perm.permute(0, 2, 1, 3)  # [N, F, K, d]
+        if self.p3_memory_checkpoint and torch.is_grad_enabled() and self.training:
 
-        # --- scores / capacity / confidence (P2 plan §6-§17, unchanged) ----
-        s_rel = self.transport_scorer(f_block, g_perm)  # [N, F, K]
+            def _context_scores(r_seg: torch.Tensor, f_cat_seg: torch.Tensor):
+                g_cat, _m = relation_weighted_mean(
+                    edge_index, r_seg, f_cat_seg, num_nodes,
+                    edge_chunk_size=self.edge_chunk_size,
+                )  # [N, K, F*d]
+                g_perm = g_cat.reshape(num_nodes, self.num_relations, num_factors, factor_dim)
+                g_perm = g_perm.permute(0, 2, 1, 3)  # [N, F, K, d]
+                s_rel = self.transport_scorer(f_block, g_perm)  # [N, F, K]
+                return g_perm, s_rel
+
+            g_perm, s_rel = torch.utils.checkpoint.checkpoint(
+                _context_scores, r, f_cat, use_reentrant=False
+            )
+        else:
+            g_cat, _mass = relation_weighted_mean(
+                edge_index, r, f_cat, num_nodes, edge_chunk_size=self.edge_chunk_size
+            )  # [N, K, F*d]
+            g_perm = g_cat.reshape(num_nodes, self.num_relations, num_factors, factor_dim)
+            g_perm = g_perm.permute(0, 2, 1, 3)  # [N, F, K, d]
+            s_rel = self.transport_scorer(f_block, g_perm)  # [N, F, K]
         s_aug = build_augmented_scores(s_rel, self.null_score)  # [N, F, K+1]
         nu = build_reference_capacity(
             availability,

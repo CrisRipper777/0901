@@ -90,6 +90,10 @@ def _run_single_nc(cfg, data: MAGData, device: torch.device, logger: logging.Log
         "num_classes": data.num_classes,
         "text_dim": int(data.x_t.shape[1]) if data.x_t is not None else 0,
         "visual_dim": int(data.x_i.shape[1]) if data.x_i is not None else 0,
+        # Additive keys for label-aware models (RPTA migration, 2026-09-03):
+        # existing models ignore them; the training protocol is unchanged.
+        "y": data.y,
+        "train_idx": data.train_idx,
     }
     model = build_model(cfg, data_info).to(device)
     classifier = nn.Linear(model.out_dim, int(data.num_classes)).to(device)

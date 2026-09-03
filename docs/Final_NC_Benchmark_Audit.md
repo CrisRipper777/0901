@@ -75,10 +75,11 @@ lr/wd preset 表（model 级 override task 级，nc.py:48-49）：
 - 移植自 `OpenMAG/src/model/models.py`（LGMRec + HGNNLayer）与
   `OpenMAG/configs/model/lgmrec.yaml`（hidden 128 / 3×LGConv / hyper_num 64 /
   alpha 0.1 / dropout 0.2）；lr/wd preset 5e-3/1e-5（OpenMAG NC task 默认）；
-- **协议适配（记录在案）**：统一 NC 协议下 full-graph 训练 → OpenMAG 的
-  按 batch InfoNCE（λ_v=λ_t=0.5, τ=0.07）改为每 forward 对全图随机子集
-  （nce_batch_size=1024）计算；eval 用 softmax(score/τ) 代替 gumbel 噪声；
-  OpenMAG 的 label_smoothing=0.1 **未**采用（统一协议为 plain CE）；
-- LightGCN 自环在模型内添加（OpenMAG self_loop=True 语义）；
-- 15/15 runs 完成（同一统一协议快照），tests 6/6；主表显示其为第二强 baseline
-  （avg rank 4.20，Movies/Toys/Grocery 三个 ②）。
+- **协议统一（用户决定 2026-09-03）**：**不采用** OpenMAG 的 InfoNCE aux
+  （λ_v=λ_t=0.5）与其 vision/text heads/decoders —— LGMRec 与其他 baseline
+  完全一致地跑 plain-CE 统一协议（aux_loss≡0）；OpenMAG 的
+  label_smoothing=0.1 也未采用；eval 用 softmax(score/τ) 代替 gumbel 噪声；
+  LightGCN 自环在模型内添加（OpenMAG self_loop=True 语义）；
+- 第一轮（含 InfoNCE aux）的 15 runs 已归档至
+  `outputs/baseline_nc/_lgmrec_infonce_archive/`（不计入主表）；当前主表使用
+  纯 CE 版本的 15/15 runs，tests 6/6。

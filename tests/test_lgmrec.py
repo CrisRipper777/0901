@@ -1,4 +1,5 @@
-"""Unit tests for the LGMRec port (OpenMAG reference implementation)."""
+"""Unit tests for the LGMRec port (OpenMAG reference, unified plain-CE
+protocol — no InfoNCE aux)."""
 
 from __future__ import annotations
 
@@ -24,10 +25,6 @@ def _make_cfg() -> object:
             "alpha": 0.1,
             "lr": 5e-3,
             "weight_decay": 1e-5,
-            "nce_batch_size": 8,
-            "nce_tau": 0.07,
-            "lambda_v": 0.5,
-            "lambda_t": 0.5,
         }
     })
 
@@ -59,8 +56,16 @@ def test_lgmrec_forward_shapes_and_finite() -> None:
     assert z.shape == (N, HIDDEN)
     assert second is None and third is None
     assert torch.isfinite(z).all()
-    assert aux.ndim == 0 and torch.isfinite(aux) and aux.item() > 0
-    assert "lgmrec_infonce" in aux_info
+    assert aux.ndim == 0 and aux.item() == 0.0  # unified protocol: no aux
+    assert aux_info == {}
+
+
+def test_lgmrec_no_aux_modules() -> None:
+    """The OpenMAG InfoNCE heads/decoders are dropped under the unified
+    protocol (no dead params)."""
+    model = Model(_make_cfg(), _make_info())
+    for name in ("vision_head", "text_head", "decoder_v", "decoder_t"):
+        assert not hasattr(model, name)
 
 
 def test_lgmrec_gradient_flow() -> None:
@@ -68,8 +73,7 @@ def test_lgmrec_gradient_flow() -> None:
     model.train()
     z, _, _, aux, _ = model(_make_x(), _make_edge())
     (z.square().mean() + aux).backward()
-    for component in (model.feat_encoder, model.vision_head, model.text_head,
-                      model.decoder_v, model.decoder_t, model.hgnn.hyper_projector):
+    for component in (model.feat_encoder, model.hgnn.hyper_projector):
         for p in component.parameters():
             assert p.grad is not None and torch.isfinite(p.grad).all(), f"{component} bad grad"
 
@@ -83,13 +87,6 @@ def test_lgmrec_inference_equivalence() -> None:
     z_inf = model.inference(x, edge_index, device=torch.device("cpu"))
     assert z_inf.shape == (N, HIDDEN)
     assert torch.allclose(z_fwd, z_inf, atol=1e-6)
-
-
-def test_lgmrec_eval_aux_is_zero() -> None:
-    model = Model(_make_cfg(), _make_info())
-    model.eval()
-    _, _, _, aux, _ = model(_make_x(), _make_edge())
-    assert aux.item() == 0.0
 
 
 def test_lgmrec_out_dim() -> None:

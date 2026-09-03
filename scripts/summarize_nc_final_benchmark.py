@@ -113,13 +113,18 @@ def main() -> None:
                 "f1": agg(dataset, model, "test_f1"),
             }
 
-    # per-dataset ranks by TEST acc (paper table); best baseline per dataset
+    # per-dataset ranks — computed INDEPENDENTLY per metric (user decision
+    # 2026-09-03): Test Acc ranks and Test F1 ranks are separate.
     ranks: dict = {}
+    ranks_f1: dict = {}
     best_baseline: dict = {}
     for dataset in DATASETS:
         means = {m: statistics.mean(agg_cells[(dataset, m)]["test"]) for m in MODELS if agg_cells[(dataset, m)]["test"]}
         order = sorted(means, key=lambda m: -means[m])
         ranks[dataset] = {m: order.index(m) + 1 for m in order}
+        f1_means = {m: statistics.mean(agg_cells[(dataset, m)]["f1"]) for m in MODELS if agg_cells[(dataset, m)]["f1"]}
+        f1_order = sorted(f1_means, key=lambda m: -f1_means[m])
+        ranks_f1[dataset] = {m: f1_order.index(m) + 1 for m in f1_order}
         baseline_means = {m: means[m] for m in BASELINE_MODELS if m in means}
         best_baseline[dataset] = max(baseline_means, key=baseline_means.get)
 
@@ -175,7 +180,7 @@ def main() -> None:
     )
     lines.append("")
 
-    def _md_table(key: str, title: str, val: bool = False) -> None:
+    def _md_table(key: str, title: str, rank_dict: dict, mark: bool = True) -> None:
         lines.append(f"## {title}")
         lines.append("")
         header = "| Model | " + " | ".join(DATASETS) + " | Avg Rank |"
@@ -189,18 +194,17 @@ def main() -> None:
                 if not vals:
                     cells.append("")
                     continue
-                mark = _fmt_rank_mark(ranks[dataset].get(model, 99))
-                cells.append(f"{_mean_std(vals)}{mark}")
-                if not val:
-                    rank_vals.append(ranks[dataset].get(model, len(MODELS)))
+                cell_mark = _fmt_rank_mark(rank_dict[dataset].get(model, 99)) if mark else ""
+                cells.append(f"{_mean_std(vals)}{cell_mark}")
+                rank_vals.append(rank_dict[dataset].get(model, len(MODELS)))
             avg_rank = f"{statistics.mean(rank_vals):.2f}" if rank_vals else ""
             lines.append(f"| {model} | " + " | ".join(cells) + f" | {avg_rank} |")
         lines.append("")
 
-    lines.append("> ① best, ② second best per dataset (Test Acc). Avg Rank on Test Acc.")
+    lines.append("> ① best, ② second best per dataset — ranks computed independently per metric.")
     lines.append("")
-    _md_table("test", "Table 1 — Test Accuracy (mean±population std)")
-    _md_table("f1", "Table 2 — Test Macro-F1 (mean±population std)")
+    _md_table("test", "Table 1 — Test Accuracy (mean±population std)", ranks)
+    _md_table("f1", "Table 2 — Test Macro-F1 (mean±population std)", ranks_f1)
 
     lines.append("## Per-dataset summary")
     lines.append("")
@@ -218,12 +222,15 @@ def main() -> None:
     lines.append("")
 
     rank_vals = [ranks[d].get("biaxis_final", len(MODELS)) for d in DATASETS]
+    rank_f1_vals = [ranks_f1[d].get("biaxis_final", len(MODELS)) for d in DATASETS]
     top1 = sum(1 for d in DATASETS if ranks[d].get("biaxis_final") == 1)
     top2 = sum(1 for d in DATASETS if ranks[d].get("biaxis_final", 99) <= 2)
+    top1_f1 = sum(1 for d in DATASETS if ranks_f1[d].get("biaxis_final") == 1)
+    top2_f1 = sum(1 for d in DATASETS if ranks_f1[d].get("biaxis_final", 99) <= 2)
     lines.append("## Overall")
     lines.append("")
-    lines.append(f"- Average rank (Test Acc): **{statistics.mean(rank_vals):.2f}** / {len(MODELS)}")
-    lines.append(f"- Top-1 datasets: {top1}/5 — Top-2 datasets: {top2}/5")
+    lines.append(f"- Average rank (Test Acc): **{statistics.mean(rank_vals):.2f}** / {len(MODELS)} — Top-1: {top1}/5, Top-2: {top2}/5")
+    lines.append(f"- Average rank (Test Macro-F1): **{statistics.mean(rank_f1_vals):.2f}** / {len(MODELS)} — Top-1: {top1_f1}/5, Top-2: {top2_f1}/5")
     lines.append("")
 
     lines.append("## Paired-seed deltas (Test Acc, pp; reference only — no structure selection)")
@@ -239,7 +246,7 @@ def main() -> None:
 
     lines.append("## Val Acc (decision protocol reference; mean±population std)")
     lines.append("")
-    _md_table("val", "Val Accuracy", val=True)
+    _md_table("val", "Val Accuracy", ranks, mark=False)
 
     lines.append("## Params (model+head, per run log)")
     lines.append("")

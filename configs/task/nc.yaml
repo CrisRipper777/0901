@@ -29,3 +29,19 @@ save_ckpt_path: null
 
 loss:
   aux_weight: 1.0
+
+# R1.5 val-only screen (plan §4): evaluate_test=false skips all test access
+# and test metrics (backward-compatible; default true keeps the formal
+# benchmark behavior unchanged).
+evaluate_test: true
+
+# R1.5 per-epoch training history (plan §9): null = off (default). Set to a
+# CSV path to record per-epoch train CE/aux split, train acc (full-graph
+# mode), val metrics, lr, patience and the P0 aux components.
+history_path: null
+
+# R1.5 LR schedule (plan §R15-4): null (default, constant LR) |
+# warmup_cosine (warmup scheduler_warmup_epochs -> cosine to min).
+scheduler: null
+scheduler_warmup_epochs: 10
+scheduler_min_lr: 1.0e-5

@@ -42,10 +42,12 @@ def main() -> None:
     parser.add_argument("--ckpt", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--ckpt-root", default=None,
+                        help="checkpoint tree root (default outputs/perf_r2d1/<variant_root>)")
     args = parser.parse_args()
 
     device = torch.device(args.device)
-    setup = load_r2_setup(args.dataset, args.seed, args.variant, device)
+    setup = load_r2_setup(args.dataset, args.seed, args.variant, device, root=args.ckpt_root)
     assert_no_test_access(setup.data)
 
     outdir = Path(args.out)

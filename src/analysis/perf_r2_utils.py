@@ -73,14 +73,20 @@ def resolve_cfg(dataset: str, seed: int, variant: str) -> object:
         return compose(config_name="config", overrides=overrides)
 
 
-def load_r2_setup(dataset: str, seed: int, variant: str, device: torch.device) -> R2Setup:
-    """Load an R2 checkpoint model + head + data. NEVER reads test labels."""
+def load_r2_setup(
+    dataset: str, seed: int, variant: str, device: torch.device, root: Path | None = None
+) -> R2Setup:
+    """Load an R2 checkpoint model + head + data. NEVER reads test labels.
+
+    root = per-variant base directory (default outputs/perf_r2d1/<variant_root>);
+    the checkpoint lives at root/<dataset>/<variant>/seed_<seed>/model.pt."""
     from src.data import load_mag_data
     from src.models.biaxis_r2 import Model
 
     cfg = resolve_cfg(dataset, seed, variant)
     data = load_mag_data(cfg, "nc", int(seed))
-    ckpt_path = CKPT_ROOT / VARIANT_ROOTS[variant] / dataset / variant / f"seed_{seed}" / "model.pt"
+    base = Path(root) if root is not None else CKPT_ROOT / VARIANT_ROOTS[variant]
+    ckpt_path = base / dataset / variant / f"seed_{seed}" / "model.pt"
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     model = Model(cfg, ckpt["data_info"])
     model.load_state_dict(ckpt["model_state"])

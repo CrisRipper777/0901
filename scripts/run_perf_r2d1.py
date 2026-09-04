@@ -113,13 +113,14 @@ def _run_job(
     no_diagnostics: bool,
     gpu_locks: dict[int, _WeightedSemaphore],
     slots_per_gpu: int = 1,
+    out_root: Path | None = None,
 ) -> None:
     lock = gpu_locks.get(gpu_id)
     weight = int(slots_per_gpu) if dataset in LARGE_DATASETS else 1
     if lock is not None:
         lock.acquire(weight)
     try:
-        _run_job_locked(dataset, variant, seed, gpu_id, force, epochs, no_diagnostics)
+        _run_job_locked(dataset, variant, seed, gpu_id, force, epochs, no_diagnostics, out_root)
     finally:
         if lock is not None:
             lock.release(weight)
@@ -133,9 +134,11 @@ def _run_job_locked(
     force: bool,
     epochs: int | None,
     no_diagnostics: bool,
+    out_root: Path | None = None,
 ) -> None:
     # Seed subdirs always (seed42 screen merges with 43/44 later, plan §31).
-    outdir = PROJECT_ROOT / "outputs" / "perf_r2d1" / VARIANT_ROOTS[variant] / dataset / variant / f"seed_{seed}"
+    base = out_root if out_root is not None else PROJECT_ROOT / "outputs" / "perf_r2d1" / VARIANT_ROOTS[variant]
+    outdir = base / dataset / variant / f"seed_{seed}"
     outdir.mkdir(parents=True, exist_ok=True)
     tag = f"[{gpu_id}] {dataset} {variant} seed={seed}"
     summary_path = outdir / "summary.json"
@@ -187,6 +190,9 @@ def _run_job_locked(
             "--ckpt", str(outdir / "model.pt"),
             "--out", str(outdir), "--device", "cuda:0",
         ]
+        if out_root is not None:
+            # out_root is the per-variant base (e.g. outputs/perf_r2d15/b0_confirm)
+            diag_cmd += ["--ckpt-root", str(out_root)]
         print(f"{tag} DIAG", flush=True)
         diag_log = outdir / "diag.log"
         with diag_log.open("w", encoding="utf-8") as log:
@@ -245,6 +251,12 @@ def main() -> None:
         help="concurrent jobs per GPU: large datasets (ele-fashion) take ALL "
         "slots (full card), small datasets take 1 and pack together",
     )
+    parser.add_argument(
+        "--out-root",
+        type=str,
+        default=None,
+        help="override output root (default outputs/perf_r2d1/<variant_root>)",
+    )
     args = parser.parse_args()
 
     datasets = NC_DATASETS
@@ -267,9 +279,10 @@ def main() -> None:
     gpu_iter = iter(gpus * (len(jobs) // len(gpus) + 1))
     slots = max(1, int(args.slots_per_gpu))
     gpu_locks = {gpu_id: _WeightedSemaphore(slots) for gpu_id in gpus}
+    out_root = Path(args.out_root) if args.out_root else None
     print(
         f"[driver] jobs={len(jobs)} gpus={gpus} slots/gpu={slots} "
-        f"out=outputs/perf_r2d1/{{b0,functional,semantic,joint}} "
+        f"out={out_root or 'outputs/perf_r2d1/{b0,functional,semantic,joint}'} "
         f"evaluate_test=false",
         flush=True,
     )
@@ -280,7 +293,7 @@ def main() -> None:
             gpu_id = next(gpu_iter)
             futures[executor.submit(
                 _run_job, dataset, variant, seed, gpu_id, args.force,
-                args.epochs, args.no_diagnostics, gpu_locks, slots
+                args.epochs, args.no_diagnostics, gpu_locks, slots, out_root
             )] = job
         for future in as_completed(futures):
             job = futures[future]

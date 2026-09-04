@@ -285,6 +285,122 @@ def _write_semantic_report() -> None:
     print(f"[semantic] saved -> {SEMANTIC_ROOT / 'R2D16_SEMANTIC_REPORT.md'}")
 
 
+def _write_confirm_report() -> None:
+    """B0-PRODDIFF 3-seed confirmation (user-directed, beyond the
+    pre-registered gate: the seed42 screen verdict was WEAK at +0.299pp,
+    0.001pp below the +0.30 GO line — plan §55 gates confirmation on GO;
+    the user explicitly requested this one confirmation)."""
+    from src.analysis.perf_r2d16_utils import GUARD_DATASETS, SEEDS
+
+    variants = ("HEAD", "PRODDIFF")
+    summaries = _load_summaries(INTERACTION_ROOT, variants, parents=["B0"],
+                                datasets=TARGET_DATASETS + GUARD_DATASETS,
+                                seeds=tuple(SEEDS))
+    outdir = R2D16_ROOT / "interaction_confirm"
+    outdir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for key, s in summaries.items():
+        parent, ds, variant, seed = key
+        h = summaries.get((parent, ds, "HEAD", seed))
+        rows.append({
+            "parent": parent, "dataset": ds, "variant": variant, "seed": seed,
+            "val_acc": s["val_acc"], "val_macro_f1": s["val_macro_f1"],
+            "delta_acc_vs_head": (s["val_acc"] - h["val_acc"]) if h else None,
+            "delta_f1_vs_head": (s["val_macro_f1"] - h["val_macro_f1"]) if h else None,
+            "mismatch_val_acc": s.get("mismatch_val_acc"),
+            "real_minus_mismatch": (s["val_acc"] - s["mismatch_val_acc"])
+            if s.get("mismatch_val_acc") is not None else None,
+            "best_epoch": s.get("best_epoch"),
+        })
+    with (outdir / "interaction_confirm_results.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else [])
+        writer.writeheader()
+        writer.writerows(rows)
+    lines = [
+        "# R2D16_INTERACTION_CONFIRM_REPORT — B0-PRODDIFF 3-Seed Confirmation",
+        "",
+        "> USER-DIRECTED confirmation: the pre-registered gate (plan §55) "
+        "required a within-parent frozen GO, while B0-PRODDIFF seed42 was "
+        "WEAK at +0.299pp (0.001pp below the +0.30 GO line). This single "
+        "candidate confirmation runs per explicit user instruction. Frozen "
+        "B0 parent per seed (b0_confirm), fresh classifier shared init, "
+        "mismatch perm seed 20260904. Val only, no Test.",
+        "",
+        "## Step A — Guards (seed42, vs HEAD)",
+        "",
+        "| guard | Δ Acc (pp) | Δ Macro-F1 (pp) | Acc ≥ −0.20pp | F1 ≥ −0.50pp |",
+        "|---|---:|---:|---|---|",
+    ]
+    guard_safe = True
+    for ds in GUARD_DATASETS:
+        s = summaries.get(("B0", ds, "PRODDIFF", 42))
+        h = summaries.get(("B0", ds, "HEAD", 42))
+        if not s or not h:
+            lines.append(f"| {ds} | MISSING | MISSING | no | no |")
+            guard_safe = False
+            continue
+        d_acc = s["val_acc"] - h["val_acc"]
+        d_f1 = s["val_macro_f1"] - h["val_macro_f1"]
+        ok_acc = d_acc >= -0.20 / 100
+        ok_f1 = d_f1 >= -0.50 / 100
+        guard_safe = guard_safe and ok_acc and ok_f1
+        lines.append(f"| {ds} | {_pp(d_acc)} | {_pp(d_f1)} | {'yes' if ok_acc else 'no'} "
+                     f"| {'yes' if ok_f1 else 'no'} |")
+    lines += [
+        "",
+        f"**Guards: {'SAFE' if guard_safe else 'FAILED'}**",
+        "",
+        "## Step B — Formal (Movies/Toys/Grocery x seeds 42/43/44, Δ vs HEAD)",
+        "",
+        "| dataset | s42 | s43 | s44 | 3-seed mean (pp) | pos seeds | Real−Mismatch mean (pp) |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    mtg_means = []
+    for ds in TARGET_DATASETS:
+        deltas, mism = [], []
+        for seed in SEEDS:
+            s = summaries.get(("B0", ds, "PRODDIFF", seed))
+            h = summaries.get(("B0", ds, "HEAD", seed))
+            if s and h:
+                deltas.append(s["val_acc"] - h["val_acc"])
+                if s.get("mismatch_val_acc") is not None:
+                    mism.append(s["val_acc"] - s["mismatch_val_acc"])
+            else:
+                deltas.append(None)
+        if all(d is None for d in deltas):
+            lines.append(f"| {ds} | MISSING | - | - | - | - | - |")
+            continue
+        mean_d = statistics.mean([d for d in deltas if d is not None])
+        pos = sum(1 for d in deltas if d is not None and d > 0)
+        mism_mean = statistics.mean(mism) if mism else None
+        mtg_means.append((ds, mean_d, pos))
+        lines.append(
+            f"| {ds} | {_pp(deltas[0])} | {_pp(deltas[1])} | {_pp(deltas[2])} "
+            f"| {_pp(mean_d)} | {pos}/3 | {_pp(mism_mean)} |"
+        )
+    lines += ["", "## Verdict (plan §55 formal GO rule)", ""]
+    if not mtg_means:
+        lines.append("MISSING — no formal runs found.")
+    else:
+        macro = statistics.mean(m for _, m, _ in mtg_means)
+        pos_ds = sum(1 for _, m, _ in mtg_means if m > 0)
+        pos_ds_seed_ok = sum(1 for _, m, p in mtg_means if m > 0 and p >= 2)
+        go = (macro >= 0.30 / 100 and pos_ds >= 2 and pos_ds_seed_ok >= 2 and guard_safe)
+        lines += [
+            f"- M/T/G 3-seed macro (PRODDIFF − HEAD) = {_pp(macro)} pp",
+            f"- positive datasets: {pos_ds}/3 (with ≥2/3 positive seeds: {pos_ds_seed_ok})",
+            f"- guards: {'SAFE' if guard_safe else 'FAILED'}",
+            f"- **FORMAL VERDICT: {'GO' if go else 'NO-GO'}** "
+            "(GO = macro ≥ +0.30pp, ≥2/3 datasets positive with ≥2/3 seeds "
+            "positive, guards safe — plan §55)",
+            "",
+            "PRODDIFF vs the parameter-matched CONCAT control at seed42 was "
+            "+0.106pp (screen report) — below the +0.15pp specificity bar.",
+        ]
+    (outdir / "R2D16_INTERACTION_CONFIRM_REPORT.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"[confirm] saved -> {outdir / 'R2D16_INTERACTION_CONFIRM_REPORT.md'}")
+
+
 def _write_final_report() -> None:
     SUMMARY_DIR.mkdir(parents=True, exist_ok=True)
     interaction = _load_summaries(INTERACTION_ROOT, ("HEAD", "CONCAT", "PRODDIFF", "FiLM"))
@@ -356,9 +472,10 @@ def _write_final_report() -> None:
         "# R2D16_FINAL_DIAGNOSIS — D1.6-F Final Synthesis",
         "",
         "> Reads only completed stages. No new experiments, no Test. "
-        "D1.6-C2 (interaction confirm) and D1.6-E (schedule study) were NOT "
-        "ENTERED: no realization reached the pre-registered frozen GO gate "
-        "(plan §33/§41).",
+        "D1.6-C2 (interaction confirm) was NOT ENTERED by the pre-registered "
+        "gate (no frozen GO); a USER-DIRECTED B0-PRODDIFF 3-seed confirmation "
+        "was then run and its result is incorporated below. D1.6-E (schedule "
+        "study) was NOT ENTERED (no frozen GO candidate).",
         "",
         "## Stage ledger",
         "",
@@ -368,7 +485,7 @@ def _write_final_report() -> None:
         "| D1.6-A parent metric backfill + graph-control | PASS |",
         "| D1.6-B dual-parent propagation audit | PASS (Pt 2-hop CROSS-PARENT; HP closed) |",
         "| D1.6-C dual-parent interaction screen | PASS (no frozen GO; B0 PRODDIFF WEAK at the line) |",
-        "| D1.6-C2 interaction confirmation | NOT ENTERED (no GO) |",
+        "| D1.6-C2 B0-PRODDIFF 3-seed confirm (user-directed) | PASS — macro +0.201pp, 3/3 positive, guards safe, FORMAL NO-GO (needs +0.30pp) |",
         "| D1.6-D semantic residual screen | PASS (NO-GO both parents) |",
         "| D1.6-E schedule study | NOT ENTERED (no frozen GO candidate) |",
         "| D1.6-F final synthesis | this document |",
@@ -386,9 +503,12 @@ def _write_final_report() -> None:
         "≥2/3 seeds). C and Pv are B0-specific.",
         "4. **High-pass cross-parent stable?** NO — no factor, no parent "
         "(final-residual ≤ −0.02pp). Diversification basis CLOSED.",
-        "5. **PRODDIFF real value?** B0: +0.299pp, 3/3 positive, Real−Mismatch "
-        "+0.353pp — WEAK, 0.001pp below the +0.30 GO line. A0: −0.147pp with "
-        "F1 warning — NO-GO. B0-DEPENDENT, never parent-robust.",
+        "5. **PRODDIFF real value?** B0 seed42: +0.299pp (3/3 positive, "
+        "WEAK at the GO line). 3-seed confirm (user-directed): **+0.201pp "
+        "macro, 3/3 datasets positive, 3/3 with ≥2/3 seeds, guards safe, "
+        "Real−Mismatch +0.43/+0.60/+0.51pp** — a REPRODUCIBLE small gain "
+        "that formally fails the +0.30 GO bar. A0: −0.147pp with F1 warning "
+        "— NO-GO. B0-DEPENDENT, never parent-robust.",
         "6. **PRODDIFF over parameter-matched CONCAT?** +0.106pp — positive "
         "but below the +0.15pp specificity bar.",
         "7. **FiLM over PRODDIFF/CONCAT?** NO (+0.098pp B0 / −0.239pp A0); "
@@ -428,10 +548,13 @@ def _write_final_report() -> None:
         "",
         "The dual-parent controlled attribution answered the interaction "
         "question definitively — NO vector realization (CONCAT/PRODDIFF/FiLM "
-        "or the semantic residual) reaches frozen GO on EITHER parent; the "
-        "best case is B0-only PRODDIFF at the WEAK/GO boundary, and every "
-        "A0-side variant is F1-unsafe. The A0 machinery already encodes the "
-        "interaction; extra adapters only add redundant correction.",
+        "or the semantic residual) reaches the frozen GO bar on EITHER "
+        "parent. The best case is B0-only PRODDIFF: seed42 +0.299pp, "
+        "3-seed macro +0.201pp (3/3 datasets, guards safe, correspondence "
+        "consistent) — a stable-but-small B0-dependent gain that formally "
+        "misses the +0.30 GO bar, while every A0-side variant is F1-unsafe. "
+        "The A0 machinery already encodes the interaction; extra adapters "
+        "only add redundant correction.",
         "",
         "### Recommended R2-Design-2 route: **C — Factor-Specific Multi-Scale**",
         "",
@@ -454,12 +577,14 @@ def _write_final_report() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="R2-Design-1.6 summarizer")
     parser.add_argument("--stage", required=True,
-                        choices=["interaction", "semantic", "final"])
+                        choices=["interaction", "semantic", "confirm", "final"])
     args = parser.parse_args()
     if args.stage == "interaction":
         _write_interaction_report()
     elif args.stage == "semantic":
         _write_semantic_report()
+    elif args.stage == "confirm":
+        _write_confirm_report()
     elif args.stage == "final":
         _write_final_report()
 

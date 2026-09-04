@@ -271,23 +271,25 @@ def main() -> None:
     parser.add_argument("--parents", default=None)
     parser.add_argument("--datasets", default=None)
     parser.add_argument("--variants", default=None)
+    parser.add_argument("--seeds", default="42")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--epochs", type=int, default=None, help="smoke only")
     args = parser.parse_args()
     parents = list(PARENTS) if not args.parents else [p for p in args.parents.split(",")]
     datasets = TARGET_DATASETS if not args.datasets else [d for d in args.datasets.split(",")]
     variants = list(VARIANTS) if not args.variants else [v for v in args.variants.split(",")]
+    seeds = [int(s) for s in args.seeds.split(",")]
     gpus = [int(g) for g in args.gpus.split(",")]
-    jobs = [(p, d, v) for p in parents for d in datasets for v in variants]
+    jobs = [(p, d, v, s) for p in parents for d in datasets for v in variants for s in seeds]
     locks = {g: _Semaphore(1) for g in gpus}
     print(f"[driver] jobs={len(jobs)} gpus={gpus} out=outputs/perf_r2d16/interaction", flush=True)
     with ThreadPoolExecutor(max_workers=len(gpus)) as executor:
         futures = {}
-        for i, (p, d, v) in enumerate(jobs):
+        for i, (p, d, v, s) in enumerate(jobs):
             gpu = gpus[i % len(gpus)]
             futures[executor.submit(
-                _run_one, p, d, v, 42, gpu, args.force, args.epochs
-            )] = (p, d, v)
+                _run_one, p, d, v, s, gpu, args.force, args.epochs
+            )] = (p, d, v, s)
         for future in as_completed(futures):
             job = futures[future]
             try:

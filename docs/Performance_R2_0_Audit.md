@@ -8,13 +8,13 @@
 | 检查项 | 结果 |
 |---|---|
 | 旧 OFR checkpoints 加载 | 9/9（M/T/G × 42/43/44）加载成功 |
-| current main eval 与 R0 数学一致 | 126 行 full 复现 + 3 行 smoke **全部 diff = 0.0（位级精确）** |
+| current main eval 与 R0 数学一致 | **129/129 PASS，max diff 5.96e-8**（唯一非零 = Movies-s42 head_z_final，GPU float32 聚合的 ulp 级差，与 R0 自身审计同值） |
 | `extract_forward()` 中间量 | 全部在预期位置（见 §3） |
 | `neighbor_mean()` message direction | src→dst，与模型聚合一致（见 §5） |
 | no-Test discipline | 显式切断 + 源码级测试（见 §8） |
 | 单元测试 | `tests/test_perf_r20_utils.py` 19/19 PASS；全库 309 PASS |
 
-复现证据：`outputs/perf_r20/audit/reproduction.csv`（129 行：3 smoke + 126 full，FAIL=0，PASS_TOL=0）。
+复现证据：`outputs/perf_r20/audit/reproduction.csv`（129 行：3 smoke + 126 full，FAIL=0，PASS_TOL=0；**129/129 PASS，max diff 5.96e-8**——128/129 行 diff=0，唯一非零为 Movies-s42 `head_z_final` 的 5.960464e-08，即 R0 审计记录过的同值 ulp 差）。
 
 ### Smoke（Movies seed42，计划 §3.1）
 
@@ -28,9 +28,11 @@
 
 - 9 lifecycles × 13 个 R0 表示（h_t … z_final）+ 9 个 head z_final Val-Acc
   （对照 `perf_r0/audit/checkpoint_audit.csv` 的 checkpoint_val_acc）。
-- **全部 diff = 0.0**，判定 PASS（阈值 1e-5，软阈值 1e-4 未动用）。
+- **129/129 PASS，max diff 5.96e-8**（128/129 行 diff=0；唯一非零 =
+  Movies-s42 `head_z_final`，5.960464e-08 float32 ulp 级，与 R0 审计同值）。
+  判定 PASS（阈值 1e-5，软阈值 1e-4 未动用）。
 - 说明：R0 运行与本次运行同环境（yhf_env、sklearn 1.8.0、同 GPU 原子路径），
-  特征逐位一致，未触发 R15-0 报告的 ~2e-6 GPU 原子噪声地板。
+  ridge 特征逐位一致；唯一 ulp 差来自 head 的 GPU float32 聚合。
 
 ---
 
@@ -56,7 +58,7 @@ outputs/p3/operator/<dataset>/OFR/seed_<seed>/model.pt   (seed ∈ {42,43,44})
 R0/R2-0 的提取走 `@torch.no_grad()` + `model.eval()`，**永远不进 checkpoint 分支**。
 `biaxis_final` 是 `biaxis_p3` 的薄 alias（config 钉住 null_softmax + full_interaction），
 R2-0 沿用 R0 的 `model=biaxis_p3` + `operator_mode=full_interaction` compose 覆盖，
-与训练时完全一致。经验证据：126+3 行复现全部 diff=0.0。
+与训练时完全一致。经验证据：129/129 PASS，max diff 5.96e-8。
 
 ### 3. extract_forward 是否已提供所需中间量？
 
@@ -185,8 +187,8 @@ R2-0A/B 所需的 `neighbor_mean`（plain 1-hop）与 `g_perm` 直接复用 R0 �
 
 ## 5. 待人工审查清单（计划 §14）
 
-1. ✅ frozen checkpoint protocol —— 9/9 加载 + 129/129 位级复现；
-2. ✅ reproduction 是否复现 R0 —— 全部 diff=0.0；
+1. ✅ frozen checkpoint protocol —— 9/9 加载 + 129/129 PASS（max diff 5.96e-8）；
+2. ✅ reproduction 是否复现 R0 —— 129/129 PASS，max diff 5.96e-8；
 3. ✅ `g_perm` factor indexing —— [C, Pt, Pv] × R1..R4（位置语义）；
 4. ✅ message direction —— src→dst，与模型聚合一致；
 5. ✅ `Splus` 是否严格 topology-only —— 手算 + 源码级测试；

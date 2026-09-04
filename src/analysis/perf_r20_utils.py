@@ -44,18 +44,26 @@ _FACTOR_KEYS = {"C": "c", "Pt": "p_t", "Pv": "p_v"}
 
 
 def guard_no_test(data: object) -> object:
-    """Explicit no-Test enforcement: cut test_idx right after load.
+    """Explicit no-Test enforcement: mask test labels, then cut test_idx.
 
     train_idx / val_idx must be present (R2-0 protocols need them); test_idx
     must have been loaded by the data layer (so the cut is a deliberate
-    discipline step, not a silent empty-split artifact), then it is set to
-    None so nothing downstream can read Test.
+    discipline step, not a silent empty-split artifact). Then:
+      1. clone the original test indices;
+      2. mask data.y at those positions to -1 (so even a buggy downstream
+         read of full-graph labels can never leak test supervision);
+      3. set data.test_idx = None so nothing downstream can index Test.
+    Train/val labels are untouched.
     """
     assert data.train_idx is not None, "R2-0 requires train_idx"
     assert data.val_idx is not None, "R2-0 requires val_idx"
     assert data.test_idx is not None, (
         "data layer must provide test_idx before the no-test guard cuts it"
     )
+    assert data.y is not None, "R2-0 requires labels"
+    test_positions = data.test_idx.clone()
+    data.y = data.y.clone()
+    data.y[test_positions] = -1
     data.test_idx = None
     return data
 

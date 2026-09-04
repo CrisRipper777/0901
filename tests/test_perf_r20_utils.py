@@ -75,11 +75,11 @@ def _fake_data(**kwargs) -> MAGData:
         x=torch.zeros(4, 8),
         edge_index=torch.empty(2, 0, dtype=torch.long),
         num_nodes=4,
-        y=torch.zeros(4, dtype=torch.long),
+        y=torch.arange(4, dtype=torch.long),
         train_idx=torch.tensor([0, 1]),
         val_idx=torch.tensor([2]),
         test_idx=torch.tensor([3]),
-        num_classes=2,
+        num_classes=4,
     )
     defaults.update(kwargs)
     return MAGData(**defaults)
@@ -108,6 +108,30 @@ def test_guard_requires_train_val():
 def test_guard_requires_loaded_test_before_cut():
     with pytest.raises(AssertionError):
         r20.guard_no_test(_fake_data(test_idx=None))
+
+
+def test_guard_masks_test_labels_only():
+    """Test labels -> -1; train/val labels bitwise unchanged; test_idx cut."""
+    data = _fake_data()
+    orig_y = data.y.clone()
+    test_positions = data.test_idx.clone()
+    r20.guard_no_test(data)
+    assert data.test_idx is None
+    assert torch.equal(data.y[data.train_idx], orig_y[data.train_idx])
+    assert torch.equal(data.y[data.val_idx], orig_y[data.val_idx])
+    assert torch.all(data.y[test_positions] == -1)
+    # every non-test node keeps its original label
+    for i in range(4):
+        if i not in test_positions.tolist():
+            assert data.y[i].item() == orig_y[i].item()
+
+
+def test_guard_masks_y_does_not_mutate_original_tensor():
+    """The mask must not leak into any external handle on the y tensor."""
+    data = _fake_data()
+    external = data.y  # a caller-owned reference
+    r20.guard_no_test(data)
+    assert torch.equal(external, torch.arange(4, dtype=torch.long))
 
 
 def test_test_idx_only_referenced_inside_guard():

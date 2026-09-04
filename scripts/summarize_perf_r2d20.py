@@ -403,6 +403,41 @@ def _final_report() -> None:
         "ever did (the closed K-prototype system was topology-only).",
         "",
         "Awaiting human/ChatGPT review. No Test has been run.",
+        "",
+        "---",
+        "",
+        "## Amendment: R2-D2.0.5 Scale Realization Attribution (2026-09-05, "
+        "user-directed short control)",
+        "",
+        "Two decisive controls (details: outputs/perf_r2d20_5/"
+        "R2D205_ATTRIBUTION_REPORT.md):",
+        "",
+        "**A — alpha_Pt fixed response curve** (frozen B0 + fresh classifier, "
+        "18 runs): a genuinely useful fixed-scale region EXISTS — concave "
+        "curves peaking at alpha_Pt = 0.5-0.75 with Movies +0.63 / Toys "
+        "+0.31 / Grocery +0.64pp (mean +0.53pp) — a region the M1 SGD never "
+        "found (learned alpha ≈ 0.05-0.07).",
+        "",
+        "**B — controlled warm-start adaptation** (S1 GRAPH-UNFREEZE / "
+        "S2 GRAPH+FUSION-UNFREEZE, matched init, P0 frozen): "
+        "max(S1,S2) − HEAD = +0.126pp (S1 +0.114 / S2 +0.126; Movies "
+        "negative in both; alpha still only reaches 0.04-0.07).",
+        "",
+        "### Final ruling (user rule)",
+        "",
+        "- D2.0 Frozen-M1 = **CLEAR NO-GO** (confirmed).",
+        "- General scale hypothesis = **CLOSED**: max(S1,S2)−HEAD "
+        "+0.126pp < +0.15~0.20pp → **the Scale route definitively exits the "
+        "mainline**; no formal confirm.",
+        "- Attribution: the Pt 2-hop representation value is REAL (A) but "
+        "NOT REACHABLE by any trainable protocol (B) — an optimization "
+        "realization gap. A mechanism the current training cannot learn is "
+        "not a method.",
+        "- Next research object: **Semantic-Ownership-Aware Neighbor Utility "
+        "Learning** — learn which neighbor is useful to which ownership "
+        "factor BEFORE aggregation, with a formula-level collision audit of "
+        "RoleMAG / CoMAG / IDGL / NRI / DisenGCN preceding the design of an "
+        "edge-level pre-aggregation relation mechanism.",
     ]
     (summary_dir / "R2D20_FINAL_DIAGNOSIS.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"[final] saved -> {summary_dir}")

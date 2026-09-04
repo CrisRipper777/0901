@@ -304,13 +304,41 @@ def explicit_channels(
 def assert_feature_dim(tensor: torch.Tensor, n_rows: int, n_cols: int, tag: str) -> None:
     """Strict probe-block shape guard (plan §十五 F): [n_rows, n_cols], finite.
 
-    Every R2-0B probe block must pass through this so dimension-matched
+    Every R2-0B/C probe block must pass through this so dimension-matched
     comparisons are enforced in production, not only in unit tests.
     """
     assert tuple(tensor.shape) == (n_rows, n_cols), (
-        f"[R2-0B] {tag}: expected ({n_rows}, {n_cols}), got {tuple(tensor.shape)}"
+        f"[R2-0] {tag}: expected ({n_rows}, {n_cols}), got {tuple(tensor.shape)}"
     )
-    assert bool(torch.isfinite(tensor).all()), f"[R2-0B] {tag}: non-finite values"
+    assert bool(torch.isfinite(tensor).all()), f"[R2-0] {tag}: non-finite values"
+
+
+# ---------------------------------------------------------------------------
+# R2-0C: node-local / target-source interaction blocks (user Prompt C)
+# ---------------------------------------------------------------------------
+
+
+def factor_interaction_block(factors: dict[str, torch.Tensor]) -> torch.Tensor:
+    """I_factor = [C*Pt | C*Pv | Pt*Pv | |C-Pt| | |C-Pv| | |Pt-Pv|]  [N, 6d].
+
+    factors: {"C", "Pt", "Pv"} each [N, d_f]. Pure elementwise ops (finite
+    whenever the factors are finite).
+    """
+    C, Pt, Pv = factors["C"], factors["Pt"], factors["Pv"]
+    return torch.cat(
+        [C * Pt, C * Pv, Pt * Pv, (C - Pt).abs(), (C - Pv).abs(), (Pt - Pv).abs()],
+        dim=-1,
+    )
+
+
+def modal_interaction_block(h_t: torch.Tensor, h_v: torch.Tensor) -> torch.Tensor:
+    """I_modal = [h_t*h_v | |h_t-h_v|]  [N, 2*hidden]."""
+    return torch.cat([h_t * h_v, (h_t - h_v).abs()], dim=-1)
+
+
+def cond_interaction_block(F: torch.Tensor, N: torch.Tensor) -> torch.Tensor:
+    """I_ab = [F*N | |F-N|]  [N, 2*d] — target factor x neighbor source context."""
+    return torch.cat([F * N, (F - N).abs()], dim=-1)
 
 
 # ---------------------------------------------------------------------------

@@ -31,7 +31,7 @@ from src.analysis.perf_r0_utils import (  # noqa: E402
     ridge_probe,
     write_csv,
 )
-from src.models.biaxis_p1_components import zscore_columns  # noqa: E402
+from src.models.biaxis_p1_components import neighbor_mean, zscore_columns  # noqa: E402
 
 DATASETS = ["Movies", "Toys", "Grocery"]  # R2-0 first round (plan §1.4)
 _EPS = 1e-8
@@ -233,6 +233,84 @@ def context_concat(parts: list[torch.Tensor]) -> torch.Tensor:
     """Concatenate feature blocks along the last dim:
     [F^b | N^a] / [F^b | G^a] / [F | G1 | G2 | ...] probes."""
     return torch.cat(parts, dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# R2-0B: explicit structural-function channels (user Prompt B, §四)
+# ---------------------------------------------------------------------------
+
+
+def structural_edge_weights(
+    edge_index: torch.Tensor,
+    splus: torch.Tensor,
+    eps: float = _EPS,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Structural similarity / contrast edge weights for observed edge j->i:
+
+        c_ji    = cos(Splus_j, Splus_i)
+        w_sim   = (1 + c_ji) / 2 + eps
+        w_diff  = (1 - c_ji) / 2 + eps
+
+    Returns (w_sim, w_diff) [E] float32. Deterministic, topology-only
+    (Splus is topology-only). No threshold / temperature / learned weight.
+
+    Numerical hardening (2026-09-04): the cosine is computed in float64 and
+    clamped to [-1, 1] — float32 rounding can push c slightly past 1, which
+    makes w_diff negative (~1e-7) and near-zero denominators change sign,
+    turning the contrastive mean into a 0/0-type ratio that swings by O(1)
+    under 1e-6 input noise (measured 0.28 on Movies). The mathematical range
+    of a cosine is [-1, 1]; the clamp restores the intended formula, and
+    float64 removes the rounding overshoot. Formula, eps and semantics are
+    unchanged.
+    """
+    edge_index = torch.as_tensor(edge_index, dtype=torch.long)
+    src, dst = edge_index[0], edge_index[1]
+    a = splus[src].double()
+    b = splus[dst].double()
+    c = F.cosine_similarity(a, b, dim=-1).clamp(-1.0, 1.0).float()
+    return (1.0 + c) * 0.5 + eps, (1.0 - c) * 0.5 + eps
+
+
+def explicit_channels(
+    edge_index: torch.Tensor,
+    f: torch.Tensor,
+    splus: torch.Tensor,
+    num_nodes: int,
+    edge_chunk_size: int | None = None,
+    eps: float = _EPS,
+) -> dict[str, torch.Tensor]:
+    """Explicit 4-channel structural basis for one factor F [N, d] (user §四):
+
+        G1    = P F            (1-hop ordinary, == neighbor_mean)
+        G2    = P G1           (2-hop diffusion; no explicit 2-hop edge list)
+        Gsim  = weighted_neighbor_mean(w_sim, F)
+        Gdiff = weighted_neighbor_mean(w_diff, F)
+
+    All channels [N, d]; deterministic topology-only weights. Isolated
+    nodes keep finite zero rows.
+    """
+    g1 = neighbor_mean(edge_index, f, num_nodes, edge_chunk_size=edge_chunk_size)
+    g2 = neighbor_mean(edge_index, g1, num_nodes, edge_chunk_size=edge_chunk_size)
+    w_sim, w_diff = structural_edge_weights(edge_index, splus, eps=eps)
+    gsim = weighted_neighbor_mean(
+        edge_index, w_sim, f, num_nodes, edge_chunk_size=edge_chunk_size, eps=eps
+    )
+    gdiff = weighted_neighbor_mean(
+        edge_index, w_diff, f, num_nodes, edge_chunk_size=edge_chunk_size, eps=eps
+    )
+    return {"G1": g1, "G2": g2, "Gsim": gsim, "Gdiff": gdiff}
+
+
+def assert_feature_dim(tensor: torch.Tensor, n_rows: int, n_cols: int, tag: str) -> None:
+    """Strict probe-block shape guard (plan §十五 F): [n_rows, n_cols], finite.
+
+    Every R2-0B probe block must pass through this so dimension-matched
+    comparisons are enforced in production, not only in unit tests.
+    """
+    assert tuple(tensor.shape) == (n_rows, n_cols), (
+        f"[R2-0B] {tag}: expected ({n_rows}, {n_cols}), got {tuple(tensor.shape)}"
+    )
+    assert bool(torch.isfinite(tensor).all()), f"[R2-0B] {tag}: non-finite values"
 
 
 # ---------------------------------------------------------------------------

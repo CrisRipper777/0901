@@ -839,6 +839,7 @@ class Model(nn.Module):
         if self.operator_kind in ("target_film", "edge_film"):
             out = {"operator_kind": self.operator_kind}
             idx = torch.randperm(num_edges, device=dst.device)[:subsample]
+            pats = {}
             for (a, b) in ALL_PAIRS:
                 e_a = self.operator_emb.weight[a]
                 e_b = self.operator_emb.weight[b]
@@ -848,6 +849,7 @@ class Model(nn.Module):
                                    e_b.unsqueeze(0).expand(num_nodes, -1)], dim=-1)
                     gb = self.operator_net(u)  # [N, 2d]
                     dg = gb[:, :d]
+                    pats[(a, b)] = dg  # per-node gamma pattern
                 else:
                     s_c, d_c = src[idx], dst[idx]
                     fa, fb = f_block[s_c, a], f_block[d_c, b]
@@ -856,6 +858,7 @@ class Model(nn.Module):
                                    e_b.unsqueeze(0).expand(idx.size(0), -1)], dim=-1)
                     gb = self.operator_net(u)
                     dg = gb[:, :d]
+                    pats[(a, b)] = dg  # sampled-edge gamma pattern
                 out[f"pair_{a}{b}"] = {
                     "gamma_mean": float(dg.mean().item()),
                     "gamma_std": float(dg.std().item()),
@@ -864,14 +867,6 @@ class Model(nn.Module):
                     "featurewise_var_mean": float(dg.var(dim=0).mean().item()),
                 }
             # pair divergence: pairwise cosine of per-pair gamma patterns
-            pats = {}
-            for (a, b) in ALL_PAIRS:
-                e_a = self.operator_emb.weight[a]
-                e_b = self.operator_emb.weight[b]
-                u = torch.cat([f_block[:, b],
-                               e_a.unsqueeze(0).expand(num_nodes, -1),
-                               e_b.unsqueeze(0).expand(num_nodes, -1)], dim=-1)
-                pats[(a, b)] = self.operator_net(u)[:, :d]
             keys = list(ALL_PAIRS)
             div = [[round(float(torch.nn.functional.cosine_similarity(
                 pats[ki], pats[kj], dim=-1).mean().item()), 4)

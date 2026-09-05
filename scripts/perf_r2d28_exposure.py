@@ -67,7 +67,7 @@ def run_worker(dataset: str, variant: str, seed: int, outdir: Path,
     setup = load_a0_parent(dataset, seed, device)
     data = setup.data
     cfg = resolve_cfg(dataset, seed, EXPOSURE_VARIANTS[variant])
-    model = build_model(cfg, data, setup.model, device)
+    model = build_model(cfg, data, setup.parent, device)
     head = load_or_make_head_init(
         HEAD_INIT_ROOT / f"{dataset}_seed{seed}_d{model.out_dim}.pt",
         model.out_dim, int(data.num_classes), device)

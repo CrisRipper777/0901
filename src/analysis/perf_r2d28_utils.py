@@ -47,6 +47,17 @@ from src.analysis.perf_r2d27_utils import (  # noqa: E402
 R2D28_ROOT = PROJECT_ROOT / "outputs" / "perf_r2d28"
 HEAD_INIT_ROOT = R2D27_ROOT / "head_init"  # shared classifier init with D2.7
 
+# stage output roots (v2 plan §16 completion package)
+AUDIT_ROOT = R2D28_ROOT / "audit"
+REPAIR_ROOT = R2D28_ROOT / "repair"
+EXPOSURE_ROOT = R2D28_ROOT / "exposure"
+COMPOSITION_ROOT = R2D28_ROOT / "composition"
+CHANNEL_ROOT = R2D28_ROOT / "channel"
+OPERATOR_ROOT = R2D28_ROOT / "operator"
+FACTORIAL_ROOT = R2D28_ROOT / "factorial"
+CONFIRM_ROOT = R2D28_ROOT / "confirm"
+SUMMARY_ROOT = R2D28_ROOT / "summary"
+
 CLASSIFIER_SEED = 20260904
 
 # variant label -> model config overrides (stages fill exposure= with E*)

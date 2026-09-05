@@ -87,7 +87,7 @@ def run_worker(dataset: str, variant: str, seed: int, outdir: Path,
 
     from src.models.biaxis_r2_neighbor_utility import Model
 
-    model = Model(cfg, info, setup.model).to(device)
+    model = Model(cfg, info, setup.parent).to(device)
     ckpt_path = D27_CKPT_ROOTS[variant] / dataset / variant / f"seed_{seed}" / "best.pt"
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["model_state"])

@@ -40,6 +40,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import torch
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -132,12 +134,12 @@ def run_worker(dataset: str, variant: str, intervention: str, setting: str,
         ablation_metrics, load_mag_data_wrap, load_or_make_head_init,
         resolve_capacity_cfg, train_capacity_variant,
     )
-    from src.models.biaxis_r2_capacity import Model, MODE_EXPERTS
+    from src.models.biaxis_r2_capacity import EXPERT_KEYS, Model
 
     device = torch.device("cuda:0")
     torch.manual_seed(seed)
     cfg = resolve_capacity_cfg(dataset, seed, variant)
-    expert_keys = MODE_EXPERTS[variant]
+    expert_keys = EXPERT_KEYS[variant]
     assert expert_keys, f"variant={variant} has no hop experts; D2.5-D not applicable"
 
     expert_lr_group = None
@@ -152,7 +154,8 @@ def run_worker(dataset: str, variant: str, intervention: str, setting: str,
     elif intervention == "deep_sup":
         deep_sup_lambda = float(setting)
         cfg.model.deep_supervision.enabled = True
-        cfg.model.deep_supervision.lambda = deep_sup_lambda
+        # NOTE: "lambda" is a reserved word — dict-style access required.
+        cfg.model.deep_supervision["lambda"] = deep_sup_lambda
     elif intervention == "path_dropout":
         path_dropout_p = float(setting)
     else:

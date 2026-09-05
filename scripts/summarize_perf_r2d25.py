@@ -624,6 +624,7 @@ def _write_optimization_report(rows: list[dict]) -> Path:
         raise RuntimeError("no optimization summaries found — run perf_r2d25_optimization.py first")
     import statistics
 
+    OPTIMIZATION_ROOT.mkdir(parents=True, exist_ok=True)
     with (OPTIMIZATION_ROOT / "optimization_results.csv").open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["dataset", "variant", "intervention", "setting",
                                                "seed", "best_val_acc", "best_val_macro_f1",

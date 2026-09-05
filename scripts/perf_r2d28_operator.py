@@ -254,9 +254,12 @@ def summarize() -> None:
                     "effective_experts": st[key].get("effective_experts"),
                 })
     if usage_rows:
+        fields = ["dataset", "variant", "seed", "kind", "pair", "gamma_mean",
+                  "gamma_std", "beta_mean", "beta_std", "featurewise_var_mean",
+                  "q_mean", "router_entropy_mean", "effective_experts"]
         with (OPERATOR_ROOT / "operator_usage.csv").open("w", encoding="utf-8",
                                                          newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(usage_rows[0].keys()))
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
             w.writeheader()
             for r in usage_rows:
                 w.writerow(r)

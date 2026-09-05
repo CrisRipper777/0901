@@ -408,7 +408,7 @@ class Model(nn.Module):
         """Basis-operator output [C, d] and router assignment [C, K]."""
         c = int(g_src.size(0))
         k = self.operator_net.k
-        if causal == "router_uniformize":
+        if causal == "router_uniformize" or self.operator_net.uniform_router:
             q = torch.full((c, k), 1.0 / k, dtype=fb.dtype, device=fb.device)
             return self.operator_net.apply(v, q), q
         e_a = self.operator_emb.weight[a]

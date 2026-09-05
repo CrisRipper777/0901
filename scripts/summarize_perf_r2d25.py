@@ -744,7 +744,9 @@ def _write_hop_attention_report() -> Path:
 
     HOP_ROOT = R2D25_ROOT / "hop_attention"
     attn_rows = _collect_capacity_rows_from(HOP_ROOT)
-    base_rows = _collect_capacity()
+    # base rows: EARLY_MIX from the capacity matrix, h1_attention from this
+    # stage's own root (it was trained into hop_attention/<ds>/h1_attention/).
+    base_rows = _collect_capacity() + _collect_capacity_rows_from(HOP_ROOT)
     if not attn_rows:
         raise RuntimeError("no hop_attention summaries found — run "
                            "perf_r2d25_capacity_train.py --out-root outputs/perf_r2d25/hop_attention")
@@ -811,12 +813,13 @@ def _write_hop_attention_report() -> Path:
             r = by_attn.get((ds, "hop_attention", s))
             if not r or not r.get("attention_weights"):
                 continue
-            aw = r["attention_weights"]  # [6, 3] flat (3 factors x 2 layers)
+            aw = r["attention_weights"]  # 6 entries: per (factor, layer) a [3,3] matrix
             lines.append(f"- {ds} s{s}:")
             for f in range(3):
-                lay = aw[2 * f : 2 * f + 2]
-                lines.append(f"  - factor {f}: L1 " + " ".join(f"{v:.2f}" for v in lay[0])
-                             + " | L2 " + " ".join(f"{v:.2f}" for v in lay[1]))
+                layers = aw[2 * f : 2 * f + 2]
+                for li, layer in enumerate(layers):
+                    rows = [" ".join(f"{v:.2f}" for v in row) for row in layer]
+                    lines.append(f"  - factor {f} L{li + 1}: " + " | ".join(rows))
     lines.append("")
     lines.append("Verdict: entered because SEP_CONCAT/INCEPTION beat WIDE_B0 by")
     lines.append(">= +0.20pp (F1) while D2.5-B shows the late readout still limits")
@@ -934,11 +937,17 @@ def _write_final_synthesis() -> tuple[Path, Path, Path]:
         {"hypothesis": "H1 strong-path dominance starves the H2 branch",
          "stage": "D2.5-C ablations", "verdict": "NOT SUPPORTED (Toys/Grocery H2-off > H1-off) -> D3 path dropout skipped",
          "evidence": "outputs/perf_r2d25/capacity/capacity_mechanism.csv"},
-        {"hypothesis": "expert LR / deep supervision unlock the H2 value",
-         "stage": "D2.5-D", "verdict": "PENDING D2.5-D results",
+        {"hypothesis": "expert LR unlocks the H2 value",
+         "stage": "D2.5-D", "verdict": "NOT SUPPORTED (1e-2: sep_concat +0.26pp 2/3, inception -0.18pp)",
          "evidence": "outputs/perf_r2d25/optimization/"},
-        {"hypothesis": "hop-token attention converts token exchange into gains",
-         "stage": "D2.5-E", "verdict": "PENDING / not entered",
+        {"hypothesis": "deep supervision (expert-preserving aux heads) helps",
+         "stage": "D2.5-D", "verdict": "SUPPORTED (sep_concat +0.35pp 3/3 ds, inception +0.31pp 3/3 ds) -> Gradient Starvation SUPPORTED (partial)",
+         "evidence": "outputs/perf_r2d25/optimization/"},
+        {"hypothesis": "H1 strong-path dominance starves H2",
+         "stage": "D2.5-D pre-check", "verdict": "NOT SUPPORTED (Toys/Grocery h2_off > h1_off) -> D3 path dropout skipped (pre-registered)",
+         "evidence": "outputs/perf_r2d25/capacity/capacity_mechanism.csv"},
+        {"hypothesis": "hop-token attention converts cross-hop token exchange into gains",
+         "stage": "D2.5-E", "verdict": "PARTIAL: vs h1_attention control +1.20pp acc / +1.43pp F1 (3/3 ds) but vs EARLY_MIX only +0.13/+0.00pp (parity)",
          "evidence": "outputs/perf_r2d25/hop_attention/"},
     ]
     with ledger.open("w", encoding="utf-8", newline="") as f:

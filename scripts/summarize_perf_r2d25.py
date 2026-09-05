@@ -957,10 +957,13 @@ def _write_final_synthesis() -> tuple[Path, Path, Path]:
         for r in ledger_rows:
             writer.writerow(r)
 
-    diagnosis.write_text(
-        "# R2-Design-2.5 — FINAL DIAGNOSIS (skeleton, to be completed at Prompt 7)\n\n"
-        "Placeholder written by --stage final; the 17-question synthesis is\n"
-        "authored at Prompt 7 after D2.5-D/E completion.\n", encoding="utf-8")
+    # The 17-question synthesis is authored at Prompt 7; never clobber a
+    # completed diagnosis with the skeleton.
+    if not diagnosis.exists() or "skeleton" in diagnosis.read_text():
+        diagnosis.write_text(
+            "# R2-Design-2.5 — FINAL DIAGNOSIS (skeleton, to be completed at Prompt 7)\n\n"
+            "Placeholder written by --stage final; the 17-question synthesis is\n"
+            "authored at Prompt 7 after D2.5-D/E completion.\n", encoding="utf-8")
     return master, ledger, diagnosis
 
 

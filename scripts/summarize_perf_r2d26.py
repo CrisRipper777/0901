@@ -584,10 +584,11 @@ def _write_final_synthesis() -> tuple[Path, Path, Path]:
 
     master_rows = []
     for stage, root in (("no_compression", NC_ROOT), ("integration", INTEGRATION_ROOT),
-                        ("parent_adapt", PARENT_ADAPT_ROOT),
                         ("deep_supervision", DEEP_SUP_ROOT)):
         for r in _collect(root):
             master_rows.append({"stage": stage, **r})
+    for r in _collect_parent_adapt():
+        master_rows.append({"stage": "parent_adapt", **r})
     if master_rows:
         fields = ["stage"] + sorted({k for r in master_rows for k in r if k != "stage"})
         with master.open("w", encoding="utf-8", newline="") as f:

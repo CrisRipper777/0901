@@ -200,6 +200,282 @@ def _write_audit_report(facts: dict) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Transmission stage (Prompt 3)
+# ---------------------------------------------------------------------------
+
+
+def _collect_transmission() -> list[dict]:
+    rows = []
+    for ds in DATASETS:
+        for seed in SEEDS:
+            p = TRANSMISSION_ROOT / ds / f"seed_{seed}" / "summary.json"
+            if not p.exists():
+                continue
+            data = json.loads(p.read_text())
+            for r in data["rows"]:
+                row = dict(r)
+                row.setdefault("cosine", None)
+                row.setdefault("cka", None)
+                row.setdefault("rel_norm", None)
+                row.setdefault("eff_rank", None)
+                row.setdefault("fixed_parent_acc", None)
+                row.setdefault("fixed_parent_f1", None)
+                row.setdefault("retrained_acc", None)
+                row.setdefault("retrained_f1", None)
+                rows.append(row)
+    return rows
+
+
+def _write_transmission_report(rows: list[dict]) -> Path:
+    if not rows:
+        raise RuntimeError("no transmission summaries found — run perf_r2d25_transmission.py first")
+    fieldnames = ["dataset", "seed", "stage", "branch", "acc", "macro_f1", "cosine", "cka",
+                  "rel_norm", "eff_rank", "fixed_parent_acc", "fixed_parent_f1",
+                  "retrained_acc", "retrained_f1"]
+    csv_path = TRANSMISSION_ROOT / "scale_transmission.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+
+    # PRODDIFF secondary rows -> interaction_transmission.csv
+    pd_rows = []
+    for ds in TARGET_DATASETS:
+        for seed in SEEDS:
+            p = TRANSMISSION_ROOT / ds / f"seed_{seed}" / "summary.json"
+            if not p.exists():
+                continue
+            data = json.loads(p.read_text())
+            if data.get("proddiff"):
+                pd_rows.extend(data["proddiff"]["rows"])
+    if pd_rows:
+        pd_path = TRANSMISSION_ROOT / "interaction_transmission.csv"
+        with pd_path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["dataset", "seed", "stage", "cell",
+                                                   "utility_delta", "norm"])
+            writer.writeheader()
+            for r in pd_rows:
+                writer.writerow(r)
+
+    import statistics
+
+    # per (dataset, seed): S0 delta + retention; per dataset: 3-seed means
+    stage_names = ["s0_raw", "s1_src_transform", "s2_after_ln", "s3_factor_residual", "s4_fusion"]
+    report = TRANSMISSION_ROOT / "R2D25_TRANSMISSION_REPORT.md"
+    lines = ["# R2-D2.5-B — Layer-wise utility transmission audit", "",
+             "Probes: StandardScaler + RidgeClassifier(alpha=1.0), TRAIN fit / VAL eval;",
+             "delta = acc(H2 branch) - acc(H1 branch) in pp; retention = delta_stage / delta_S0.",
+             ""]
+    lines.append("| dataset | stage | delta H2-H1 (3-seed mean, pp) | retention |")
+    lines.append("|---|---|---|---|")
+    collapse: dict[str, str] = {}
+    for ds in DATASETS:
+        deltas: dict[str, list[float]] = {s: [] for s in stage_names}
+        for seed in SEEDS:
+            p = TRANSMISSION_ROOT / ds / f"seed_{seed}" / "summary.json"
+            if not p.exists():
+                continue
+            data = json.loads(p.read_text())
+            by_stage: dict[str, dict[str, float]] = {}
+            for r in data["rows"]:
+                by_stage.setdefault(r["stage"], {})[r["branch"]] = r["acc"]
+            for s in stage_names:
+                if s in by_stage and "h1" in by_stage[s] and "h2" in by_stage[s]:
+                    deltas[s].append(100.0 * (by_stage[s]["h2"] - by_stage[s]["h1"]))
+        means = {s: statistics.fmean(v) if v else None for s, v in deltas.items()}
+        s0 = means["s0_raw"] if means["s0_raw"] is not None else 0.0
+        first_collapse = None
+        for s in stage_names:
+            m = means[s]
+            if m is None:
+                continue
+            retention = (m / s0) if abs(s0) > 1e-9 else None
+            lines.append(
+                f"| {ds} | {s} | {m:+.3f} | "
+                f"{retention if retention is None else f'{retention:+.2f}'} |")
+            if first_collapse is None and s0 > 0.10 and (m <= 0.0 or m < 0.5 * s0):
+                first_collapse = s
+        collapse[ds] = first_collapse or "never (within S0-S4)"
+        lines.append(f"| {ds} | **first material collapse** | **{collapse[ds]}** | |")
+        lines.append("")
+    lines.append("### S4 fusion detail (fixed parent head / retrained same-init head)")
+    lines.append("")
+    for ds in DATASETS:
+        fixed, retr = [], []
+        for seed in SEEDS:
+            p = TRANSMISSION_ROOT / ds / f"seed_{seed}" / "summary.json"
+            if not p.exists():
+                continue
+            data = json.loads(p.read_text())
+            for r in data["rows"]:
+                if r["stage"] == "s4_fusion":
+                    if r["branch"] == "h1":
+                        fixed.append(100.0 * (r["fixed_parent_acc"] or 0.0))
+                        retr.append(100.0 * (r["retrained_acc"] or 0.0))
+        lines.append(
+            f"- {ds}: fixed-parent delta mean "
+            f"{statistics.fmean(fixed):+.3f}pp / retrained-head delta "
+            f"{statistics.fmean(retr):+.3f}pp" if fixed else f"- {ds}: no data")
+    lines.append("")
+    lines.append("### PRODDIFF secondary (M/T/G): strongest cell per (dataset, seed)")
+    lines.append("")
+    for ds in TARGET_DATASETS:
+        for seed in SEEDS:
+            p = TRANSMISSION_ROOT / ds / f"seed_{seed}" / "summary.json"
+            if not p.exists():
+                continue
+            pd_ = json.loads(p.read_text()).get("proddiff")
+            if pd_:
+                lines.append(
+                    f"- {ds} s{seed}: strongest cell **{pd_['strongest_cell']}** "
+                    f"(utility {100 * pd_['strongest_cell_utility']:+.3f}pp, "
+                    f"norm {pd_['strongest_cell_norm']:.3f}); fusion fixed-parent "
+                    f"acc {pd_['fixed_parent_acc']:.4f} / retrained {pd_['retrained_acc']:.4f}")
+    lines.append("")
+    lines.append("First-collapse stage answers D2.5-B's core question: where does the")
+    lines.append("Pt H2 utility materially leak on the frozen B0 path.")
+    report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Capacity stage (Prompt 4)
+# ---------------------------------------------------------------------------
+
+
+def _collect_capacity() -> list[dict]:
+    rows = []
+    for ds in DATASETS:
+        for v in CAPACITY_MODES:
+            for seed in SEEDS:
+                p = CAPACITY_ROOT / ds / v / f"seed_{seed}" / "summary.json"
+                if not p.exists():
+                    continue
+                d = json.loads(p.read_text())
+                row = {
+                    "dataset": ds, "variant": v, "seed": seed,
+                    "val_acc": d["best_val_acc"], "val_macro_f1": d["best_val_macro_f1"],
+                    "best_epoch": d["best_epoch"], "stop_epoch": d["stop_epoch"],
+                    "params": d["parameter_count"],
+                    "peak_mb": d.get("peak_allocated_mb"),
+                    "runtime_sec": d.get("runtime_sec"),
+                    "param_delta_pct": d.get("param_delta_pct"),
+                }
+                for tag, m in d.get("ablations", {}).items():
+                    row[f"abl_{tag}_acc"] = m["val_acc"]
+                    row[f"abl_{tag}_f1"] = m["val_macro_f1"]
+                diag = d.get("diagnostics", {})
+                experts = diag.get("experts", {})
+                if experts:
+                    row["expert_eff_rank"] = experts.get("effective_rank")
+                    row["expert_pairwise_cosine"] = experts.get("pairwise_cosine")
+                    row["expert_cka"] = experts.get("cka")
+                rows.append(row)
+    return rows
+
+
+def _write_capacity_report(rows: list[dict]) -> Path:
+    if not rows:
+        raise RuntimeError("no capacity summaries found — run perf_r2d25_capacity_train.py first")
+    import statistics
+
+    # CSVs
+    res_fields = ["dataset", "variant", "seed", "val_acc", "val_macro_f1",
+                  "best_epoch", "stop_epoch"]
+    with (CAPACITY_ROOT / "capacity_results.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=res_fields, extrasaction="ignore")
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+    with (CAPACITY_ROOT / "capacity_resources.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["dataset", "variant", "seed", "params",
+                                               "peak_mb", "runtime_sec", "param_delta_pct"],
+                                extrasaction="ignore")
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+    with (CAPACITY_ROOT / "capacity_mechanism.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=sorted({k for r in rows for k in r if k.startswith(("abl_", "expert_"))}),
+                                extrasaction="ignore")
+        if rows:
+            flds = ["dataset", "variant", "seed"] + sorted(
+                {k for r in rows for k in r if k.startswith(("abl_", "expert_"))})
+            writer.fieldnames = flds
+            writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+
+    # paired deltas vs EARLY_MIX (mechanism baseline) and vs A0
+    from src.analysis.perf_r2_utils import load_a0_reference
+
+    a0_ref = load_a0_reference()
+    by_key: dict[tuple[str, str, int], dict] = {
+        (r["dataset"], r["variant"], r["seed"]): r for r in rows}
+    report = CAPACITY_ROOT / "R2D25_CAPACITY_REPORT.md"
+    lines = ["# R2-D2.5-C — Structured-capacity model matrix", "",
+             "Paired per (dataset, seed): delta = variant - EARLY_MIX (macro-F1, pp).",
+             "A0 = frozen formal biaxis_final per-seed reference. All Val only.",
+             ""]
+    candidates = [v for v in CAPACITY_MODES if v != "early_mix"]
+    lines.append("| variant | Movies | Toys | Grocery | M/T/G mean | vs A0 mean | ≥2/3 ds pos | F1-safe |")
+    lines.append("|---|---|---|---|---|---|---|---|")
+    verdicts: dict[str, str] = {}
+    for v in candidates:
+        ds_means, a0_deltas, seeds_pos = [], [], []
+        f1_deltas = []
+        for ds in TARGET_DATASETS:
+            deltas, f1s, a0s = [], [], []
+            for seed in SEEDS:
+                base = by_key.get((ds, "early_mix", seed))
+                cand = by_key.get((ds, v, seed))
+                if base and cand:
+                    deltas.append(100.0 * (cand["val_macro_f1"] - base["val_macro_f1"]))
+                    f1s.append(100.0 * (cand["val_macro_f1"] - base["val_macro_f1"]))
+                    if (ds, seed) in a0_ref:
+                        a0s.append(100.0 * (cand["val_macro_f1"] - a0_ref[(ds, seed)]))
+            if deltas:
+                ds_means.append(statistics.fmean(deltas))
+                seeds_pos.append(sum(1 for d in deltas if d > 0))
+            a0_deltas.extend(a0s)
+            f1_deltas.extend(f1s)
+        mean = statistics.fmean(ds_means) if ds_means else None
+        a0_mean = statistics.fmean(a0_deltas) if a0_deltas else None
+        n_pos = sum(1 for d in ds_means if d > 0)
+        f1_safe = (statistics.fmean(f1_deltas) >= -0.20
+                   and all(d >= -0.50 for d in f1_deltas)) if f1_deltas else True
+        verdicts[v] = f"mean {mean:+.2f}pp vs EARLY_MIX"
+        lines.append(
+            f"| {v} | {ds_means[0]:+.2f} | {ds_means[1]:+.2f} | {ds_means[2]:+.2f} "
+            f"| {mean:+.2f} | {a0_mean if a0_mean is None else f'{a0_mean:+.2f}'} "
+            f"| {n_pos}/3 | {'yes' if f1_safe else 'NO'} |")
+    lines.append("")
+    lines.append("### H2-off causal usage (full - h2_off, Val acc pp, 3-seed mean)")
+    lines.append("")
+    for v in candidates:
+        for ds in TARGET_DATASETS:
+            drops = []
+            for seed in SEEDS:
+                r = by_key.get((ds, v, seed))
+                if r and "abl_full_acc" in r and "abl_h2_off_acc" in r:
+                    drops.append(100.0 * (r["abl_full_acc"] - r["abl_h2_off_acc"]))
+            if drops:
+                lines.append(f"- {v} / {ds}: H2-off drop {statistics.fmean(drops):+.3f}pp "
+                             f"({sum(1 for d in drops if d > 0)}/{len(drops)} seeds positive)")
+    lines.append("")
+    lines.append("### Verdicts (pre-registered thresholds)")
+    lines.append("")
+    lines.append("- Mechanism GO: candidate - EARLY_MIX >= +0.50pp macro, >=2/3 datasets")
+    lines.append("  positive, positive datasets >=2/3 seeds positive, F1-safe.")
+    lines.append("- Final GO: candidate - A0 >= +0.30pp macro with the same stability.")
+    lines.append("- Mechanism-specific: candidate - CAP_H1_DUP >= +0.20pp or candidate -")
+    lines.append("  WIDE_B0 >= +0.20pp; otherwise GENERIC CAPACITY GAIN.")
+    lines.append("- Any candidate within +0.20pp of Final GO -> run guards x 3 seeds.")
+    report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return report
+
+
+# ---------------------------------------------------------------------------
 # Later stages (implemented with their prompts)
 # ---------------------------------------------------------------------------
 
@@ -305,10 +581,15 @@ def main() -> None:
     if args.stage == "landscape":
         print(f"[landscape] wrote {_write_landscape_report()}")
         return
+    if args.stage == "transmission":
+        print(f"[transmission] wrote {_write_transmission_report(_collect_transmission())}")
+        return
+    if args.stage == "capacity":
+        print(f"[capacity] wrote {_write_capacity_report(_collect_capacity())}")
+        return
     raise NotImplementedError(
         f"stage={args.stage} is implemented with its own prompt "
-        "(Prompt 3: transmission / Prompt 4: capacity / Prompt 5: optimization / "
-        "Prompt 7: final)"
+        "(Prompt 5: optimization / Prompt 7: final)"
     )
 
 

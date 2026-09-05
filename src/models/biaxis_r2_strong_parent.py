@@ -316,7 +316,9 @@ class Model(nn.Module):
             u = self.side_fusion(torch.cat([s_c, s_pt, s_pv], dim=-1))
             return z_base + self.r_side(u)
         if rt == "base_anchored_hier_attention":
-            q = torch.stack([self.factor_projs[f](s[:, f]) for f in range(3)], dim=1)
+            # the (possibly ablated) factor summaries, not the original s
+            s_block = torch.stack([s_c, s_pt, s_pv], dim=1)  # [N, 3, d]
+            q = torch.stack([self.factor_projs[f](s_block[:, f]) for f in range(3)], dim=1)
             tokens4 = torch.stack([z_base, q[:, 0], q[:, 1], q[:, 2]], dim=1)  # [N,4,h]
             final, _attn = self._ckpt(self.cross_attn, tokens4)
             return z_base + self.w_out(final[:, 0] - z_base)

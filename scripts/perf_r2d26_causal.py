@@ -95,8 +95,12 @@ def run_worker(dataset: str, variant: str, seed: int, outdir: Path,
 
     x = setup.data.x.to(device)
     ei = setup.data.edge_index.to(device)
+    # side_off returns the h-dim z_base: only residual readouts (out_dim==h)
+    # can evaluate it through the candidate head.
+    keys = [k for k in CAUSAL_KEYS
+            if k != "side_off" or model.out_dim == model.hidden_dim]
     causal = causal_metrics(model, head, x, ei, setup.data, device,
-                            causal_keys=CAUSAL_KEYS)
+                            causal_keys=tuple(keys))
     with torch.no_grad():
         diag = model.compute_diagnostics(x, ei)
         sens = model.gradient_sensitivity(x, ei)

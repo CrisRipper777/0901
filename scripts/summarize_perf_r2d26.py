@@ -351,7 +351,7 @@ def _write_causal_report(rows: list[dict]) -> Path:
              "PT_H2_OFF} >= +0.20pp on M/T/G macro.", ""]
     variants = sorted({r["variant"] for r in rows})
     for v in variants:
-        vrows = {r["seed"]: r for r in rows if r["variant"] == v}
+        vrows = {(r["dataset"], r["seed"]): r for r in rows if r["variant"] == v}
         lines.append(f"## {v}")
         lines.append("")
         lines.append("| causal | M/T/G acc drop (pp, 3-seed) | M/T/G F1 drop (pp) |")
@@ -361,12 +361,12 @@ def _write_causal_report(rows: list[dict]) -> Path:
             drops_acc, drops_f1 = [], []
             for ds in TARGET_DATASETS:
                 for s in SEEDS:
-                    r = vrows.get(s)
+                    r = vrows.get((ds, s))
                     if not r:
                         continue
                     full = r["causal"].get("full")
                     cf = r["causal"].get(key)
-                    if full and cf and r["dataset"] == ds:
+                    if full and cf:
                         drops_acc.append(100.0 * (full["val_acc"] - cf["val_acc"]))
                         drops_f1.append(100.0 * (full["val_macro_f1"] - cf["val_macro_f1"]))
             if drops_acc:
@@ -378,8 +378,8 @@ def _write_causal_report(rows: list[dict]) -> Path:
             drops = []
             for ds in TARGET_DATASETS:
                 for s in SEEDS:
-                    r = vrows.get(s)
-                    if not r or r["dataset"] != ds:
+                    r = vrows.get((ds, s))
+                    if not r:
                         continue
                     full = r["causal"].get("full")
                     cf = r["causal"].get(key)
@@ -391,8 +391,8 @@ def _write_causal_report(rows: list[dict]) -> Path:
         drops = []
         for ds in TARGET_DATASETS:
             for s in SEEDS:
-                r = vrows.get(s)
-                if not r or r["dataset"] != ds:
+                r = vrows.get((ds, s))
+                if not r:
                     continue
                 full = r["causal"].get("full")
                 cf = r["causal"].get("h2_zero")

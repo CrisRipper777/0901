@@ -595,27 +595,28 @@ def _collect_optimization() -> list[dict]:
             for i_dir in sorted(v_dir.iterdir()):
                 if not i_dir.is_dir():
                     continue
-                for s_dir in sorted(i_dir.iterdir()):
-                    if not s_dir.is_dir():
+                for set_dir in sorted(i_dir.iterdir()):  # setting_<v>
+                    if not set_dir.is_dir():
                         continue
-                    sp = s_dir / "summary.json"
-                    if not sp.exists():
-                        continue
-                    d = json.loads(sp.read_text())
-                    rows.append({
-                        "dataset": ds, "variant": d["variant"], "intervention": d["intervention"],
-                        "setting": d["setting"], "seed": d["seed"],
-                        "best_val_acc": d["best_val_acc"],
-                        "best_val_macro_f1": d["best_val_macro_f1"],
-                        "train_ce_at_best": d.get("train_ce_at_best"),
-                        "val_ce_at_best": d.get("val_ce_at_best"),
-                        "expert_output_norm": d.get("expert_output_norm"),
-                        "classifier_sensitivity": d.get("classifier_sensitivity"),
-                        "expert_param_stats": d.get("expert_param_stats"),
-                        "ablations": d.get("ablations", {}),
-                        "best_epoch": d.get("best_epoch"),
-                        "stop_epoch": d.get("stop_epoch"),
-                    })
+                    for seed_dir in sorted(set_dir.iterdir()):  # seed_<s>
+                        sp = seed_dir / "summary.json"
+                        if not sp.exists():
+                            continue
+                        d = json.loads(sp.read_text())
+                        rows.append({
+                            "dataset": ds, "variant": d["variant"], "intervention": d["intervention"],
+                            "setting": d["setting"], "seed": d["seed"],
+                            "best_val_acc": d["best_val_acc"],
+                            "best_val_macro_f1": d["best_val_macro_f1"],
+                            "train_ce_at_best": d.get("train_ce_at_best"),
+                            "val_ce_at_best": d.get("val_ce_at_best"),
+                            "expert_output_norm": d.get("expert_output_norm"),
+                            "classifier_sensitivity": d.get("classifier_sensitivity"),
+                            "expert_param_stats": d.get("expert_param_stats"),
+                            "ablations": d.get("ablations", {}),
+                            "best_epoch": d.get("best_epoch"),
+                            "stop_epoch": d.get("stop_epoch"),
+                        })
     return rows
 
 
@@ -629,22 +630,29 @@ def _write_optimization_report(rows: list[dict]) -> Path:
         writer = csv.DictWriter(f, fieldnames=["dataset", "variant", "intervention", "setting",
                                                "seed", "best_val_acc", "best_val_macro_f1",
                                                "train_ce_at_best", "val_ce_at_best",
-                                               "best_epoch", "stop_epoch"])
+                                               "best_epoch", "stop_epoch"],
+                                extrasaction="ignore")
         writer.writeheader()
         for r in rows:
             writer.writerow(r)
     with (OPTIMIZATION_ROOT / "optimization_gradients.csv").open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["dataset", "variant", "intervention", "setting",
                                                "seed", "expert_output_norm",
-                                               "classifier_sensitivity", "expert_param_stats"])
+                                               "classifier_sensitivity", "expert_param_stats"],
+                                extrasaction="ignore")
         writer.writeheader()
         for r in rows:
             if r["intervention"] == "base":
                 continue
+            r = dict(r)
+            for k in ("expert_output_norm", "classifier_sensitivity", "expert_param_stats"):
+                if isinstance(r.get(k), dict):
+                    r[k] = json.dumps(r[k])
             writer.writerow(r)
 
-    by_key: dict[tuple[str, str, str, int], dict] = {
-        (r["dataset"], r["variant"], r["intervention"], r["seed"]): r for r in rows}
+    by_key: dict[tuple[str, str, str, str, int], dict] = {
+        (r["dataset"], r["variant"], r["intervention"], r["setting"], r["seed"]): r
+        for r in rows if r["intervention"] != "base"}
     base_key: dict[tuple[str, str, int], dict] = {
         (r["dataset"], r["variant"], r["seed"]): r
         for r in rows if r["intervention"] == "base"}
@@ -673,9 +681,9 @@ def _write_optimization_report(rows: list[dict]) -> Path:
                 for ds in TARGET_DATASETS:
                     deltas = []
                     for seed in SEEDS:
-                        cand = by_key.get((ds, v, i, seed))
+                        cand = by_key.get((ds, v, i, setting, seed))
                         base = base_key.get((ds, v, seed))
-                        if cand and base and cand["setting"] == setting:
+                        if cand and base:
                             deltas.append(100.0 * (cand["best_val_acc"] - base["best_val_acc"]))
                     if deltas:
                         ds_means.append(statistics.fmean(deltas))
@@ -695,9 +703,9 @@ def _write_optimization_report(rows: list[dict]) -> Path:
                 norm_shifts, h2off_shifts = [], []
                 for ds in TARGET_DATASETS:
                     for seed in SEEDS:
-                        cand = by_key.get((ds, v, i, seed))
+                        cand = by_key.get((ds, v, i, setting, seed))
                         base = base_key.get((ds, v, seed))
-                        if not (cand and base and cand["setting"] == setting):
+                        if not (cand and base):
                             continue
                         n_c = cand.get("expert_output_norm") or {}
                         n_b = base.get("ablations") or {}

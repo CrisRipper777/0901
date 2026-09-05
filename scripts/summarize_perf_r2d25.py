@@ -299,7 +299,7 @@ def _write_transmission_report(rows: list[dict]) -> Path:
         collapse[ds] = first_collapse or "never (within S0-S4)"
         lines.append(f"| {ds} | **first material collapse** | **{collapse[ds]}** | |")
         lines.append("")
-    lines.append("### S4 fusion detail (fixed parent head / retrained same-init head)")
+    lines.append("### S4 fusion detail: H2-H1 delta per head (pp, 3-seed mean)")
     lines.append("")
     for ds in DATASETS:
         fixed, retr = [], []
@@ -308,15 +308,22 @@ def _write_transmission_report(rows: list[dict]) -> Path:
             if not p.exists():
                 continue
             data = json.loads(p.read_text())
+            by_branch = {}
             for r in data["rows"]:
                 if r["stage"] == "s4_fusion":
-                    if r["branch"] == "h1":
-                        fixed.append(100.0 * (r["fixed_parent_acc"] or 0.0))
-                        retr.append(100.0 * (r["retrained_acc"] or 0.0))
-        lines.append(
-            f"- {ds}: fixed-parent delta mean "
-            f"{statistics.fmean(fixed):+.3f}pp / retrained-head delta "
-            f"{statistics.fmean(retr):+.3f}pp" if fixed else f"- {ds}: no data")
+                    by_branch[r["branch"]] = r
+            if "h1" in by_branch and "h2" in by_branch:
+                fixed.append(100.0 * ((by_branch["h2"]["fixed_parent_acc"] or 0.0)
+                                      - (by_branch["h1"]["fixed_parent_acc"] or 0.0)))
+                retr.append(100.0 * ((by_branch["h2"]["retrained_acc"] or 0.0)
+                                     - (by_branch["h1"]["retrained_acc"] or 0.0)))
+        if fixed:
+            lines.append(
+                f"- {ds}: fixed-parent-head delta {statistics.fmean(fixed):+.3f}pp / "
+                f"retrained-head delta {statistics.fmean(retr):+.3f}pp "
+                f"({sum(1 for d in retr if d > 0)}/{len(retr)} seeds positive)")
+        else:
+            lines.append(f"- {ds}: no data")
     lines.append("")
     lines.append("### PRODDIFF secondary (M/T/G): strongest cell per (dataset, seed)")
     lines.append("")
@@ -409,46 +416,96 @@ def _write_capacity_report(rows: list[dict]) -> Path:
     # paired deltas vs EARLY_MIX (mechanism baseline) and vs A0
     from src.analysis.perf_r2_utils import load_a0_reference
 
-    a0_ref = load_a0_reference()
+    a0_acc = load_a0_reference()  # formal per-seed val ACC
+    # A0 per-seed val macro-F1: R1-baseline proxy (structure bitwise ==
+    # biaxis_final, max |val acc delta| 0.176pp — disclosed, D1.6 convention).
+    a0_f1: dict[tuple[str, int], float] = {}
+    for ds in DATASETS:
+        for seed in SEEDS:
+            p = PROJECT_ROOT / "outputs" / "perf_r1" / "baseline" / ds / "A0" / f"seed_{seed}" / "summary.json"
+            if p.exists():
+                d = json.loads(p.read_text())
+                if d.get("best_val_macro_f1") is not None:
+                    a0_f1[(ds, seed)] = float(d["best_val_macro_f1"]) / 100.0
     by_key: dict[tuple[str, str, int], dict] = {
         (r["dataset"], r["variant"], r["seed"]): r for r in rows}
     report = CAPACITY_ROOT / "R2D25_CAPACITY_REPORT.md"
     lines = ["# R2-D2.5-C — Structured-capacity model matrix", "",
-             "Paired per (dataset, seed): delta = variant - EARLY_MIX (macro-F1, pp).",
-             "A0 = frozen formal biaxis_final per-seed reference. All Val only.",
+             "Paired per (dataset, seed); pp. Two metrics reported: Macro-F1 (the",
+             "pre-registered verdict metric) and Accuracy (supplementary — the",
+             "B0-family has a known systematic Macro-F1 deficit, D1.6).",
+             "A0 F1 = R1-baseline A0 proxy (bitwise==biaxis_final structure,",
+             "max |val acc delta| 0.176pp, disclosed). All Val only.",
              ""]
     candidates = [v for v in CAPACITY_MODES if v != "early_mix"]
-    lines.append("| variant | Movies | Toys | Grocery | M/T/G mean | vs A0 mean | ≥2/3 ds pos | F1-safe |")
-    lines.append("|---|---|---|---|---|---|---|---|")
-    verdicts: dict[str, str] = {}
-    for v in candidates:
-        ds_means, a0_deltas, seeds_pos = [], [], []
-        f1_deltas = []
-        for ds in TARGET_DATASETS:
-            deltas, f1s, a0s = [], [], []
-            for seed in SEEDS:
-                base = by_key.get((ds, "early_mix", seed))
-                cand = by_key.get((ds, v, seed))
-                if base and cand:
-                    deltas.append(100.0 * (cand["val_macro_f1"] - base["val_macro_f1"]))
-                    f1s.append(100.0 * (cand["val_macro_f1"] - base["val_macro_f1"]))
-                    if (ds, seed) in a0_ref:
-                        a0s.append(100.0 * (cand["val_macro_f1"] - a0_ref[(ds, seed)]))
-            if deltas:
-                ds_means.append(statistics.fmean(deltas))
-                seeds_pos.append(sum(1 for d in deltas if d > 0))
-            a0_deltas.extend(a0s)
-            f1_deltas.extend(f1s)
-        mean = statistics.fmean(ds_means) if ds_means else None
-        a0_mean = statistics.fmean(a0_deltas) if a0_deltas else None
-        n_pos = sum(1 for d in ds_means if d > 0)
-        f1_safe = (statistics.fmean(f1_deltas) >= -0.20
-                   and all(d >= -0.50 for d in f1_deltas)) if f1_deltas else True
-        verdicts[v] = f"mean {mean:+.2f}pp vs EARLY_MIX"
-        lines.append(
-            f"| {v} | {ds_means[0]:+.2f} | {ds_means[1]:+.2f} | {ds_means[2]:+.2f} "
-            f"| {mean:+.2f} | {a0_mean if a0_mean is None else f'{a0_mean:+.2f}'} "
-            f"| {n_pos}/3 | {'yes' if f1_safe else 'NO'} |")
+
+    def _deltas(metric: str) -> dict[str, dict]:
+        out = {}
+        for v in candidates:
+            ds_means, seeds_pos, f1s, a0s = [], [], [], []
+            for ds in TARGET_DATASETS:
+                deltas = []
+                for seed in SEEDS:
+                    base = by_key.get((ds, "early_mix", seed))
+                    cand = by_key.get((ds, v, seed))
+                    if base and cand:
+                        d = 100.0 * (cand[metric] - base[metric])
+                        deltas.append(d)
+                        f1s.append(d)
+                        a0_val = a0_f1.get((ds, seed)) if metric == "val_macro_f1" \
+                            else a0_acc.get((ds, seed))
+                        if a0_val is not None:
+                            a0s.append(100.0 * (cand[metric] - a0_val))
+                if deltas:
+                    ds_means.append(statistics.fmean(deltas))
+                    seeds_pos.append(sum(1 for d in deltas if d > 0))
+            mean = statistics.fmean(ds_means) if ds_means else None
+            out[v] = {
+                "ds_means": ds_means, "mean": mean,
+                "n_pos": sum(1 for d in ds_means if d > 0) if ds_means else 0,
+                "seeds_pos": seeds_pos,
+                "f1_safe": (statistics.fmean(f1s) >= -0.20
+                            and all(d >= -0.50 for d in f1s)) if f1s else True,
+                "a0_mean": statistics.fmean(a0s) if a0s else None,
+                "a0_pos": sum(1 for d in a0s if d > 0) if a0s else 0,
+            }
+        return out
+
+    f1 = _deltas("val_macro_f1")
+    acc = _deltas("val_acc")
+    for metric, name in (("val_macro_f1", "Macro-F1"), ("val_acc", "Accuracy")):
+        d = f1 if metric == "val_macro_f1" else acc
+        lines.append(f"## {name} deltas vs EARLY_MIX (pp, 3-seed means)")
+        lines.append("")
+        lines.append("| variant | Movies | Toys | Grocery | M/T/G mean | vs A0 mean | ≥2/3 ds pos | F1-safe |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for v in candidates:
+            dm = d[v]["ds_means"]
+            a0_str = "None" if d[v]["a0_mean"] is None else f"{d[v]['a0_mean']:+.2f}"
+            lines.append(
+                f"| {v} | {dm[0]:+.2f} | {dm[1]:+.2f} | {dm[2]:+.2f} "
+                f"| {d[v]['mean']:+.2f} | {a0_str} "
+                f"| {d[v]['n_pos']}/3 | {'yes' if d[v]['f1_safe'] else 'NO'} |")
+        lines.append("")
+    # mechanism-specific (vs capacity controls), both metrics
+    lines.append("## Mechanism-specific: candidate - control (pp, M/T/G 3-seed mean)")
+    lines.append("")
+    lines.append("| candidate | vs CAP_H1_DUP (F1 / Acc) | vs WIDE_B0 (F1 / Acc) |")
+    lines.append("|---|---|---|")
+    for v in ("sep_sum", "sep_concat", "inception_012"):
+        vs_dup_f1 = statistics.fmean(
+            100.0 * (by_key[(ds, v, s)]["val_macro_f1"] - by_key[(ds, "cap_h1_dup", s)]["val_macro_f1"])
+            for ds in TARGET_DATASETS for s in SEEDS)
+        vs_dup_acc = statistics.fmean(
+            100.0 * (by_key[(ds, v, s)]["val_acc"] - by_key[(ds, "cap_h1_dup", s)]["val_acc"])
+            for ds in TARGET_DATASETS for s in SEEDS)
+        vs_wb_f1 = statistics.fmean(
+            100.0 * (by_key[(ds, v, s)]["val_macro_f1"] - by_key[(ds, "wide_b0", s)]["val_macro_f1"])
+            for ds in TARGET_DATASETS for s in SEEDS)
+        vs_wb_acc = statistics.fmean(
+            100.0 * (by_key[(ds, v, s)]["val_acc"] - by_key[(ds, "wide_b0", s)]["val_acc"])
+            for ds in TARGET_DATASETS for s in SEEDS)
+        lines.append(f"| {v} | {vs_dup_f1:+.2f} / {vs_dup_acc:+.2f} | {vs_wb_f1:+.2f} / {vs_wb_acc:+.2f} |")
     lines.append("")
     lines.append("### H2-off causal usage (full - h2_off, Val acc pp, 3-seed mean)")
     lines.append("")
@@ -463,7 +520,7 @@ def _write_capacity_report(rows: list[dict]) -> Path:
                 lines.append(f"- {v} / {ds}: H2-off drop {statistics.fmean(drops):+.3f}pp "
                              f"({sum(1 for d in drops if d > 0)}/{len(drops)} seeds positive)")
     lines.append("")
-    lines.append("### Verdicts (pre-registered thresholds)")
+    lines.append("### Formal verdicts (pre-registered thresholds, Macro-F1)")
     lines.append("")
     lines.append("- Mechanism GO: candidate - EARLY_MIX >= +0.50pp macro, >=2/3 datasets")
     lines.append("  positive, positive datasets >=2/3 seeds positive, F1-safe.")
@@ -471,6 +528,199 @@ def _write_capacity_report(rows: list[dict]) -> Path:
     lines.append("- Mechanism-specific: candidate - CAP_H1_DUP >= +0.20pp or candidate -")
     lines.append("  WIDE_B0 >= +0.20pp; otherwise GENERIC CAPACITY GAIN.")
     lines.append("- Any candidate within +0.20pp of Final GO -> run guards x 3 seeds.")
+    lines.append("")
+    for v in candidates:
+        if v in ("cap_h1_dup", "wide_b0"):  # controls are the references
+            continue
+        m = f1[v]
+        mech = m["mean"] is not None and m["mean"] >= 0.50 and m["n_pos"] >= 2 and m["f1_safe"]
+        final = (m["a0_mean"] is not None and m["a0_mean"] >= 0.30
+                 and m["n_pos"] >= 2 and m["f1_safe"])
+        dup = statistics.fmean(
+            100.0 * (by_key[(ds, v, s)]["val_macro_f1"] - by_key[(ds, "cap_h1_dup", s)]["val_macro_f1"])
+            for ds in TARGET_DATASETS for s in SEEDS)
+        wb = statistics.fmean(
+            100.0 * (by_key[(ds, v, s)]["val_macro_f1"] - by_key[(ds, "wide_b0", s)]["val_macro_f1"])
+            for ds in TARGET_DATASETS for s in SEEDS)
+        spec = dup >= 0.20 or wb >= 0.20
+        acc_spec = acc[v]["mean"] is not None and (
+            statistics.fmean(100.0 * (by_key[(ds, v, s)]["val_acc"] - by_key[(ds, "cap_h1_dup", s)]["val_acc"])
+                             for ds in TARGET_DATASETS for s in SEEDS) >= 0.20
+            or statistics.fmean(100.0 * (by_key[(ds, v, s)]["val_acc"] - by_key[(ds, "wide_b0", s)]["val_acc"])
+                                for ds in TARGET_DATASETS for s in SEEDS) >= 0.20)
+        lines.append(
+            f"- **{v}**: Mechanism {'GO' if mech else 'NO-GO'} "
+            f"(+{m['mean']:+.2f}pp, {m['n_pos']}/3, F1-safe={'yes' if m['f1_safe'] else 'NO'}), "
+            f"Final {'GO' if final else 'NO-GO'} "
+            f"(vs A0 {m['a0_mean'] if m['a0_mean'] is None else f'{m['a0_mean']:+.2f}'}pp), "
+            f"Mechanism-specific {'GO' if spec else 'NO-GO'} "
+            f"(vs DUP {dup:+.2f} / vs WIDE {wb:+.2f}pp F1"
+            f"{'; ACC-side mechanism-specific positive' if acc_spec and not spec else ''}).")
+    lines.append("")
+    lines.append("ACC-side note: the Macro-F1 verdicts are the pre-registered ones; ACC")
+    lines.append("deltas are reported as supplementary evidence (B0-family F1 deficit).")
+    report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Optimization stage (Prompt 5)
+# ---------------------------------------------------------------------------
+
+
+def _collect_optimization() -> list[dict]:
+    """Intervention summaries + the reused D2.5-C base rows."""
+    rows = []
+    for ds in DATASETS:
+        for v in CAPACITY_MODES:
+            for seed in SEEDS:
+                base_p = CAPACITY_ROOT / ds / v / f"seed_{seed}" / "summary.json"
+                if not base_p.exists():
+                    continue
+                d = json.loads(base_p.read_text())
+                rows.append({
+                    "dataset": ds, "variant": v, "intervention": "base", "setting": "base",
+                    "seed": seed, "best_val_acc": d["best_val_acc"],
+                    "best_val_macro_f1": d["best_val_macro_f1"],
+                    "train_ce_at_best": None, "val_ce_at_best": None,
+                    "ablations": d.get("ablations", {}),
+                })
+    for ds in DATASETS:
+        p = OPTIMIZATION_ROOT / ds
+        if not p.exists():
+            continue
+        for v_dir in sorted(p.iterdir()):
+            if not v_dir.is_dir():
+                continue
+            for i_dir in sorted(v_dir.iterdir()):
+                if not i_dir.is_dir():
+                    continue
+                for s_dir in sorted(i_dir.iterdir()):
+                    if not s_dir.is_dir():
+                        continue
+                    sp = s_dir / "summary.json"
+                    if not sp.exists():
+                        continue
+                    d = json.loads(sp.read_text())
+                    rows.append({
+                        "dataset": ds, "variant": d["variant"], "intervention": d["intervention"],
+                        "setting": d["setting"], "seed": d["seed"],
+                        "best_val_acc": d["best_val_acc"],
+                        "best_val_macro_f1": d["best_val_macro_f1"],
+                        "train_ce_at_best": d.get("train_ce_at_best"),
+                        "val_ce_at_best": d.get("val_ce_at_best"),
+                        "expert_output_norm": d.get("expert_output_norm"),
+                        "classifier_sensitivity": d.get("classifier_sensitivity"),
+                        "expert_param_stats": d.get("expert_param_stats"),
+                        "ablations": d.get("ablations", {}),
+                        "best_epoch": d.get("best_epoch"),
+                        "stop_epoch": d.get("stop_epoch"),
+                    })
+    return rows
+
+
+def _write_optimization_report(rows: list[dict]) -> Path:
+    if not rows:
+        raise RuntimeError("no optimization summaries found — run perf_r2d25_optimization.py first")
+    import statistics
+
+    with (OPTIMIZATION_ROOT / "optimization_results.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["dataset", "variant", "intervention", "setting",
+                                               "seed", "best_val_acc", "best_val_macro_f1",
+                                               "train_ce_at_best", "val_ce_at_best",
+                                               "best_epoch", "stop_epoch"])
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+    with (OPTIMIZATION_ROOT / "optimization_gradients.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["dataset", "variant", "intervention", "setting",
+                                               "seed", "expert_output_norm",
+                                               "classifier_sensitivity", "expert_param_stats"])
+        writer.writeheader()
+        for r in rows:
+            if r["intervention"] == "base":
+                continue
+            writer.writerow(r)
+
+    by_key: dict[tuple[str, str, str, int], dict] = {
+        (r["dataset"], r["variant"], r["intervention"], r["seed"]): r for r in rows}
+    base_key: dict[tuple[str, str, int], dict] = {
+        (r["dataset"], r["variant"], r["seed"]): r
+        for r in rows if r["intervention"] == "base"}
+    variants = sorted({r["variant"] for r in rows if r["intervention"] != "base"})
+    report = OPTIMIZATION_ROOT / "R2D25_OPTIMIZATION_REPORT.md"
+    lines = ["# R2-D2.5-D — Optimization-accessibility interventions", "",
+             "Single-factor interventions on the D2.5-C expert candidates; the base",
+             "setting of every intervention is the reused D2.5-C run. Paired deltas",
+             "vs base (Val Acc pp, M/T/G 3-seed mean). Pre-registered reading:",
+             "- Gradient Starvation SUPPORTED if an expert-access intervention",
+             "  (expert LR / deep supervision) improves Val >= +0.20pp mean with",
+             "  >=2/3 datasets positive;",
+             "- Objective mismatch SUPPORTED if interventions change expert usage",
+             "  (output norms / H2-off drops / train CE) without Val following.",
+             ""]
+    for v in variants:
+        lines.append(f"## {v}")
+        lines.append("")
+        lines.append("| intervention | setting | Movies | Toys | Grocery | M/T/G mean | ≥2/3 pos |")
+        lines.append("|---|---|---|---|---|---|---|")
+        interventions = ["expert_lr", "deep_sup", "path_dropout"]
+        for i in interventions:
+            for setting in ({"expert_lr": ("0.005", "0.01"), "deep_sup": ("0.1",),
+                             "path_dropout": ("0.2",)}[i]):
+                ds_means = []
+                for ds in TARGET_DATASETS:
+                    deltas = []
+                    for seed in SEEDS:
+                        cand = by_key.get((ds, v, i, seed))
+                        base = base_key.get((ds, v, seed))
+                        if cand and base and cand["setting"] == setting:
+                            deltas.append(100.0 * (cand["best_val_acc"] - base["best_val_acc"]))
+                    if deltas:
+                        ds_means.append(statistics.fmean(deltas))
+                if not ds_means:
+                    continue
+                mean = statistics.fmean(ds_means)
+                n_pos = sum(1 for d in ds_means if d > 0)
+                lines.append(
+                    f"| {i} | {setting} | {ds_means[0]:+.2f} | {ds_means[1]:+.2f} | "
+                    f"{ds_means[2]:+.2f} | {mean:+.2f} | {n_pos}/3 |")
+        # expert usage shifts (M/T/G mean) for the new settings
+        lines.append("")
+        lines.append("Expert usage shifts vs base (M/T/G 3-seed mean):")
+        for i in interventions:
+            for setting in ({"expert_lr": ("0.005", "0.01"), "deep_sup": ("0.1",),
+                             "path_dropout": ("0.2",)}[i]):
+                norm_shifts, h2off_shifts = [], []
+                for ds in TARGET_DATASETS:
+                    for seed in SEEDS:
+                        cand = by_key.get((ds, v, i, seed))
+                        base = base_key.get((ds, v, seed))
+                        if not (cand and base and cand["setting"] == setting):
+                            continue
+                        n_c = cand.get("expert_output_norm") or {}
+                        n_b = base.get("ablations") or {}
+                        if n_c:
+                            norm_shifts.append({
+                                k: (n_c.get(k, 0.0) or 0.0) for k in n_c})
+                        abl_c = cand.get("ablations", {}).get("h2_off")
+                        abl_b = base.get("ablations", {}).get("h2_off")
+                        if abl_c and abl_b:
+                            h2off_shifts.append(
+                                100.0 * ((cand["ablations"]["full"]["val_acc"]
+                                          - abl_c["val_acc"])
+                                         - (base["ablations"]["full"]["val_acc"]
+                                            - abl_b["val_acc"])))
+                if not h2off_shifts:
+                    continue
+                lines.append(
+                    f"- {i}/{setting}: H2-off drop shift "
+                    f"{statistics.fmean(h2off_shifts):+.2f}pp "
+                    f"(base-drop {100.0 * statistics.fmean([
+                        base_key[(ds, v, s)]['ablations']['full']['val_acc']
+                        - base_key[(ds, v, s)]['ablations']['h2_off']['val_acc']
+                        for ds in TARGET_DATASETS for s in SEEDS if (ds, v, s) in base_key]):.2f}pp)")
+        lines.append("")
     report.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return report
 
@@ -587,10 +837,12 @@ def main() -> None:
     if args.stage == "capacity":
         print(f"[capacity] wrote {_write_capacity_report(_collect_capacity())}")
         return
+    if args.stage == "optimization":
+        print(f"[optimization] wrote {_write_optimization_report(_collect_optimization())}")
+        return
     raise NotImplementedError(
-        f"stage={args.stage} is implemented with its own prompt "
-        "(Prompt 5: optimization / Prompt 7: final)"
-    )
+        "stage=final is implemented at Prompt 7 (synthesis)")
+
 
 
 if __name__ == "__main__":

@@ -52,10 +52,13 @@ from src.analysis.perf_r2d25_utils import (  # noqa: E402
 OPTIMIZATION_ROOT = R2D25_ROOT / "optimization"
 HEAD_INIT_ROOT = OPTIMIZATION_ROOT / "head_init"
 
-# intervention -> list of configurations (each a single-factor setting)
-EXPERT_LR_VALUES = (1e-3, 5e-3, 1e-2)
-DEEP_SUP_LAMBDAS = (0.0, 0.1)
-PATH_DROPOUT_VALUES = (0.0, 0.2)
+# intervention -> list of configurations (each a single-factor setting).
+# The BASE setting of every intervention (expert LR 1e-3 / lambda 0 / p 0)
+# IS the D2.5-C capacity run for the same (dataset, variant, seed) — the
+# summarizer reuses those rows; the driver only runs NEW settings.
+EXPERT_LR_VALUES = (5e-3, 1e-2)
+DEEP_SUP_LAMBDAS = (0.1,)
+PATH_DROPOUT_VALUES = (0.2,)
 
 
 class _Semaphore:
@@ -83,20 +86,38 @@ def _expert_output_norms(experts: dict[str, object]) -> dict[str, float]:
     return out
 
 
-def _classifier_sensitivity(experts: dict[str, object], head, train_idx, y_train) -> dict[str, float]:
-    """Per-expert classifier sensitivity = mean over factors of
-    ||dCE(head(e_f[train]))/de_f|| (autograd, diagnostic only)."""
-    out = {}
-    for key, e in experts.items():  # e: [N, 3, d]
-        norms = []
-        for f in range(e.size(1)):
-            grad = torch.autograd.grad(
-                torch.nn.functional.cross_entropy(head(e[train_idx, f]), y_train),
-                e, retain_graph=True, allow_unused=True,
-            )[0]
-            norms.append(float(grad.norm().item()) if grad is not None else 0.0)
-        out[key] = float(sum(norms) / len(norms))
-    return out
+def _expert_usage_stats(model, head, x, ei, train_idx, y_train) -> tuple[dict, dict]:
+    """One CE backward on the FULL z at the best checkpoint:
+      - classifier sensitivity per expert = ||dCE/de|| per factor (autograd);
+      - per-expert PARAM grad norm + update ratio (from .grad)."""
+    import torch.nn.functional as F
+
+    model.eval()
+    with torch.enable_grad():
+        z, experts = model.forward_with_experts(x, ei)
+        loss = F.cross_entropy(head(z[train_idx]), y_train)
+        sens: dict[str, list[float]] = {}
+        for key, e in experts.items():  # e: [N, 3, d]
+            grad = torch.autograd.grad(loss, e, retain_graph=True, allow_unused=True)[0]
+            sens[key] = [float(grad[:, f].norm().item()) for f in range(e.size(1))]
+        loss.backward()
+    param_stats: dict[str, dict[str, float]] = {}
+    for key in experts:
+        params = [p for n, p in model.named_parameters()
+                  if n.startswith(f"hop_experts.{key}.") and p.grad is not None]
+        gn = sum(p.grad.square().sum().item() for p in params) ** 0.5
+        ur = []
+        for p in params:
+            w = p.detach().norm().item()
+            if w > 0:
+                ur.append(1e-3 * p.grad.norm().item() / w)
+        param_stats[key] = {
+            "param_grad_norm": gn,
+            "update_ratio": float(sum(ur) / len(ur)) if ur else 0.0,
+        }
+    sens_out = {k: float(sum(v) / len(v)) for k, v in sens.items()}
+    sens_per_factor = {k: v for k, v in sens.items()}
+    return sens_out, {"param_stats": param_stats, "sens_per_factor": sens_per_factor}
 
 
 def run_worker(dataset: str, variant: str, intervention: str, setting: str,
@@ -170,7 +191,6 @@ def run_worker(dataset: str, variant: str, intervention: str, setting: str,
     model.eval()
     with torch.no_grad():
         z_full, experts = model.forward_with_experts(x, ei)
-        diag = model.compute_capacity_diagnostics(x, ei)
         expert_norms = _expert_output_norms(experts)
     head.eval()
     from torch.nn import CrossEntropyLoss
@@ -180,10 +200,8 @@ def run_worker(dataset: str, variant: str, intervention: str, setting: str,
     with torch.no_grad():
         train_ce = float(criterion(head(z_full[data.train_idx.to(device)]), y_train).item())
         val_ce = float(criterion(head(z_full[data.val_idx.to(device)]), y_val).item())
-    with torch.enable_grad():
-        _z_g, experts_g = model.forward_with_experts(x, ei)
-        sens = _classifier_sensitivity(experts_g, head, data.train_idx.to(device), y_train)
-        del _z_g, experts_g
+    sens, usage = _expert_usage_stats(
+        model, head, x, ei, data.train_idx.to(device), y_train)
     abl = ablation_metrics(model, head, x, ei, data, device)
     runtime_sec = time.monotonic() - t0
     summary = {
@@ -198,6 +216,8 @@ def run_worker(dataset: str, variant: str, intervention: str, setting: str,
         "train_ce_at_best": train_ce, "val_ce_at_best": val_ce,
         "expert_output_norm": expert_norms,
         "classifier_sensitivity": sens,
+        "classifier_sensitivity_per_factor": usage["sens_per_factor"],
+        "expert_param_stats": usage["param_stats"],
         "ablations": abl,
         "parameter_count": int(model.parameter_count),
         "runtime_sec": round(runtime_sec, 1),

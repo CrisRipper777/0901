@@ -203,6 +203,8 @@ def main() -> None:
     parser.add_argument("--seeds", default=None)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--epochs", type=int, default=None, help="smoke only")
+    parser.add_argument("--out-root", default=None,
+                        help="override output root (default outputs/perf_r2d25/capacity)")
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--dataset", default=None)
     parser.add_argument("--variant", default=None)
@@ -214,6 +216,10 @@ def main() -> None:
         run_worker(args.dataset, args.variant, args.seed, Path(args.outdir),
                    epochs=args.epochs, force=args.force)
         return
+
+    global CAPACITY_ROOT
+    if args.out_root:
+        CAPACITY_ROOT = Path(args.out_root)
 
     datasets = TARGET_DATASETS if not args.datasets else [d for d in args.datasets.split(",")]
     variants = list(CAPACITY_MODES) if not args.variants else [v for v in args.variants.split(",")]

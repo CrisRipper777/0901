@@ -44,6 +44,7 @@ from .biaxis_r2_capacity_components import (
     DeepFusion,
     FactorReadout,
     HopExpert,
+    HopTokenAttention,
     ResidualFusion,
     WideSourceTransform,
 )
@@ -59,12 +60,15 @@ MODES = (
     "cap_h1_dup",
     "wide_b0",
     "deep_fusion",
+    "hop_attention",
+    "h1_attention",
 )
 
 # Modes whose graph path exposes a trainable H2 branch / H2-off ablation.
-H2_MODES = ("early_mix", "sep_sum", "sep_concat", "inception_012")
+H2_MODES = ("early_mix", "sep_sum", "sep_concat", "inception_012", "hop_attention")
 
-# Expert branch names per mode (hop_experts keys); None entries = unused.
+# Expert branch names per mode (hop_experts keys); for the attention modes
+# these are the three TOKEN positions (off_hops zeroes the token).
 EXPERT_KEYS: dict[str, tuple[str, ...]] = {
     "early_mix": (),
     "sep_sum": ("e1", "e2"),
@@ -73,6 +77,8 @@ EXPERT_KEYS: dict[str, tuple[str, ...]] = {
     "cap_h1_dup": ("e1a", "e1b"),
     "wide_b0": (),
     "deep_fusion": (),
+    "hop_attention": ("e0", "e1", "e2"),
+    "h1_attention": ("e1a", "e1b", "e1c"),
 }
 
 
@@ -151,8 +157,25 @@ class Model(P0Model):
                 [FactorReadout(in_dim, d, dropout, activation, norm) for _ in range(3)]
             )
 
+        # --- D2.5-E hop-token attention (plan D2.5-E) ------------------------
+        if mode in ("hop_attention", "h1_attention"):
+            # per factor: 3 independent token projections + 2 Pre-LN blocks
+            # (embed_dim=d, 4 heads, FFN 4d, dropout 0.1).
+            self.token_projs: nn.ModuleDict = nn.ModuleDict()
+            self.token_attns = nn.ModuleList(
+                [HopTokenAttention(d, heads=4, ff_mult=4, dropout=0.1,
+                                   activation=activation, norm=norm)
+                 for _ in range(3)]
+            )
+            for key in EXPERT_KEYS[mode]:
+                self.token_projs[key] = nn.ModuleList(
+                    [nn.Linear(d, d) for _ in range(3)]
+                )
+            self.attn_last_weights: list[torch.Tensor] = []
+
         # --- fusion replacements --------------------------------------------
-        if mode in ("sep_concat", "inception_012", "cap_h1_dup"):
+        if mode in ("sep_concat", "inception_012", "cap_h1_dup",
+                    "hop_attention", "h1_attention"):
             self.fusion = DeepFusion(3 * d, h, dropout=dropout, activation=activation, norm=norm)
         elif mode == "wide_b0":
             self.fusion = DeepFusion(
@@ -276,6 +299,39 @@ class Model(P0Model):
             rho = torch.sigmoid(self.raw_rho_base)
             f_out = f_star + rho.view(1, 3, 1) * base_msg
             internals.update(h0=h0, h1=h1, h2=h2, msg_pre_ln=v_block, msg_post_ln=base_msg)
+            return f_out, internals
+
+        if mode in ("hop_attention", "h1_attention"):
+            with_h2 = mode == "hop_attention"
+            h0, h1, h2 = self._hop_contexts(f_star, edge_index, num_nodes, with_h2=with_h2)
+            # per-factor tokens: [E0, E1, E2] = [proj(h0), proj(h1), proj(h2)]
+            # (h1_attention: three INDEPENDENT H1 projections, plan D2.5-E
+            # capacity control — never touches H2).
+            token_sources = {"e0": h0, "e1": h1, "e2": h2, "e1a": h1, "e1b": h1, "e1c": h1}
+            summaries: list[torch.Tensor] = []
+            attn_weights: list[torch.Tensor] = []
+            token_blocks: dict[str, torch.Tensor] = {}
+            for f in range(3):
+                tokens = []
+                for key in EXPERT_KEYS[mode]:
+                    t = self.token_projs[key][f](token_sources[key][:, f])  # [N, d]
+                    if key in off_hops:
+                        t = torch.zeros_like(t)
+                    tokens.append(t)
+                    token_blocks.setdefault(key, []).append(t)
+                tokens_stack = torch.stack(tokens, dim=1)  # [N, 3, d]
+                summary, attn = self.token_attns[f](tokens_stack)  # [N, d], [2, 3, 3]
+                summaries.append(summary)
+                attn_weights.append(attn)
+            self.attn_last_weights = attn_weights
+            corrections = torch.stack(summaries, dim=1)  # [N, 3, d]
+            f_out = f_star + corrections
+            internals.update(
+                h0=h0, h1=h1, h2=h2,
+                tokens={k: torch.stack(v, dim=1) for k, v in token_blocks.items()},
+                attention=torch.stack(attn_weights, dim=0),  # [3, 2, 3, 3]
+                expert_out={k: torch.stack(v, dim=1) for k, v in token_blocks.items()},
+            )
             return f_out, internals
 
         if mode in ("wide_b0", "deep_fusion"):
@@ -425,7 +481,8 @@ class Model(P0Model):
         f_out, internals = self._graph_update(f_star, edge_index, num_nodes)
         z = self.fusion(torch.cat([f_out[:, 0], f_out[:, 1], f_out[:, 2]], dim=-1))
         states: dict = {"f_star": f_star, "f_out": f_out, "z": z}
-        for key in ("h0", "h1", "h2", "expert_out", "msg_pre_ln", "msg_post_ln", "readout_input"):
+        for key in ("h0", "h1", "h2", "expert_out", "msg_pre_ln", "msg_post_ln",
+                    "readout_input", "attention"):
             states[key] = internals.get(key)
         states["pre_residual"] = f_star
         states["post_residual"] = f_out
@@ -499,6 +556,13 @@ class Model(P0Model):
                 }
                 for f in range(3)
             }
+        attn = internals.get("attention")
+        if attn is not None:
+            # [F, 2 layers, 3 query, 3 key] mean weights per factor
+            diag["attention_weights"] = [
+                [[float(v) for v in row] for row in layer.cpu().tolist()]
+                for f in range(3) for layer in attn[f]
+            ]
         if self.capacity_mode == "wide_b0":
             diag["wide_match"] = dict(self._wide_match)
             diag["wide_width"] = int(self.wide_width)

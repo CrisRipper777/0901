@@ -298,7 +298,7 @@ def test_extract_capacity_states_keys_and_shapes() -> None:
         assert states["h1"].shape == (NUM_NODES, 3, FACTOR_DIM)
         assert states["pre_fusion"].shape == (NUM_NODES, 3 * FACTOR_DIM)
         assert states["post_fusion"].shape == (NUM_NODES, HIDDEN_DIM)
-        if mode in ("wide_b0", "deep_fusion", "cap_h1_dup"):
+        if mode in ("wide_b0", "deep_fusion", "cap_h1_dup", "h1_attention"):
             assert states["h2"] is None, mode
         else:
             assert states["h2"].shape == (NUM_NODES, 3, FACTOR_DIM), mode
@@ -405,3 +405,64 @@ def test_deep_supervision_heads_and_loss() -> None:
     z, experts = m.forward_with_experts(x, ei)
     loss = m.deep_supervision_loss(experts, train_idx, y_train)
     assert math.isfinite(float(loss.item()))
+
+
+# ---------------------------------------------------------------------------
+# 11. D2.5-E hop-token attention modes
+# ---------------------------------------------------------------------------
+
+
+def test_hop_attention_forward_and_extraction() -> None:
+    m = _make_model("hop_attention")
+    x, ei = _make_x(), _make_edges()
+    with torch.no_grad():
+        states = m.extract_capacity_states(x, ei)
+        z = states["z"]
+    assert z.shape == (NUM_NODES, HIDDEN_DIM)
+    assert states["h2"].shape == (NUM_NODES, 3, FACTOR_DIM)
+    assert set(states["expert_out"].keys()) == {"e0", "e1", "e2"}
+    assert states["attention"].shape == (3, 2, 3, 3)  # [factor, layer, q, k]
+    assert _finite(states["attention"])
+
+
+def test_h1_attention_never_accesses_h2(monkeypatch) -> None:
+    m = _make_model("h1_attention")
+    x, ei = _make_x(), _make_edges()
+    calls = _count_neighbor_mean_calls(monkeypatch, m, x, ei)
+    assert calls["n"] == 1  # only H1; the three tokens come from 3 H1 projs
+
+
+def test_hop_attention_h2_off_zeroes_token() -> None:
+    m = _make_model("hop_attention", dropout=0.0)
+    x, ei = _make_x(), _make_edges()
+    with torch.no_grad():
+        z_full = m(x, ei)[0]
+        z_h2off = m(x, ei, off_hops={"e2"})[0]
+        # manual: zero the e2 token projection outputs
+        saved = {f: m.token_projs["e2"][f] for f in range(3)}
+        for f in range(3):
+            m.token_projs["e2"][f] = _ZeroModule(saved[f])
+        z_manual = m(x, ei)[0]
+        for f in range(3):
+            m.token_projs["e2"][f] = saved[f]
+    assert torch.equal(z_h2off, z_manual)
+    assert not torch.equal(z_full, z_h2off)
+
+
+def test_attention_diagnostics_finite() -> None:
+    m = _make_model("hop_attention")
+    x, ei = _make_x(), _make_edges()
+    with torch.no_grad():
+        diag = m.compute_capacity_diagnostics(x, ei)
+    assert _finite(diag)
+    assert "attention_weights" in diag
+    assert len(diag["attention_weights"]) == 6  # 3 factors x 2 layers
+    assert all(len(row) == 3 for row in diag["attention_weights"])
+
+
+def test_attention_param_accounting() -> None:
+    m = _make_model("hop_attention")
+    assert m.parameter_count == sum(p.numel() for p in m.parameters())
+    c = _make_model("h1_attention")
+    # identical architecture => identical parameter counts (strict control)
+    assert c.parameter_count == m.parameter_count

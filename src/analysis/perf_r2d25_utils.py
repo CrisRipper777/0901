@@ -43,6 +43,7 @@ B0_CONFIRM_ROOT = PROJECT_ROOT / "outputs" / "perf_r2d15" / "b0_confirm"
 CAPACITY_MODES = (
     "early_mix", "sep_sum", "sep_concat", "inception_012",
     "cap_h1_dup", "wide_b0", "deep_fusion",
+    "hop_attention", "h1_attention",
 )
 # Hop branches per mode (mirrors EXPERT_KEYS in the model).
 MODE_EXPERTS = {
@@ -53,6 +54,8 @@ MODE_EXPERTS = {
     "cap_h1_dup": ("e1a", "e1b"),
     "wide_b0": (),
     "deep_fusion": (),
+    "hop_attention": ("e0", "e1", "e2"),
+    "h1_attention": ("e1a", "e1b", "e1c"),
 }
 
 # Warmup10+cosine (plan D2.5-C unified schedule).
@@ -652,6 +655,10 @@ def ablation_metrics(model: nn.Module, head: nn.Module, x, ei, data, device) -> 
         plan += [("h2_off", {"e2"}), ("h1_off", {"e1"}), ("h0_off", {"e0"})]
     elif mode == "cap_h1_dup":
         plan += [("h2_off", {"e1b"}), ("h1_off", {"e1a"})]
+    elif mode == "hop_attention":
+        plan += [("h2_off", {"e2"}), ("h1_off", {"e1"}), ("h0_off", {"e0"})]
+    elif mode == "h1_attention":
+        plan += [("h2_off", {"e1c"}), ("h1_off", {"e1a"})]
     with torch.no_grad():
         for tag, off in plan:
             z, _, _, _, _ = model(x, ei, off_hops=off)

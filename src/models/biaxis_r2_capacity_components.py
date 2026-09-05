@@ -189,3 +189,78 @@ class WideSourceTransform(nn.Module):
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         """h: [N, d] -> transformed [N, d]."""
         return self.net(h)
+
+
+# ---------------------------------------------------------------------------
+# D2.5-E: per-node hop-token attention (plan D2.5-E)
+# ---------------------------------------------------------------------------
+
+
+class _PreLNTokenBlock(nn.Module):
+    """One Pre-LN transformer block over a per-node sequence of 3 hop
+    tokens: x = x + MHA(LN(x)); x = x + FFN(LN(x)). Records the mean
+    attention matrix (averaged over heads) of this layer."""
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int = 4,
+        ff_mult: int = 4,
+        dropout: float = 0.1,
+        activation: str = "gelu",
+        norm: str = "layernorm",
+    ) -> None:
+        super().__init__()
+        self.norm1 = make_norm(norm, dim)
+        self.attn = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.norm2 = make_norm(norm, dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, ff_mult * dim),
+            get_activation(activation),
+            nn.Dropout(dropout),
+            nn.Linear(ff_mult * dim, dim),
+            nn.Dropout(dropout),
+        )
+        self.mean_attn: torch.Tensor | None = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [N, 3, d] -> [N, 3, d]; stores mean attention [3, 3]."""
+        h = self.norm1(x)
+        attn_out, weights = self.attn(h, h, h, need_weights=True)
+        self.mean_attn = weights.detach().mean(dim=0)  # [3, 3]
+        x = x + attn_out
+        h = self.norm2(x)
+        x = x + self.ffn(h)
+        return x
+
+
+class HopTokenAttention(nn.Module):
+    """Per-node, per-factor attention over 3 hop tokens (plan D2.5-E):
+    2 Pre-LN transformer blocks, embed_dim=d, 4 heads, FFN width 4d,
+    dropout 0.1. The ego/H0 token (position 0) is the query/summary —
+    its final state is the factor summary."""
+
+    def __init__(
+        self,
+        factor_dim: int,
+        heads: int = 4,
+        ff_mult: int = 4,
+        dropout: float = 0.1,
+        activation: str = "gelu",
+        norm: str = "layernorm",
+    ) -> None:
+        super().__init__()
+        d = int(factor_dim)
+        self.blocks = nn.ModuleList(
+            [_PreLNTokenBlock(d, heads, ff_mult, dropout, activation, norm) for _ in range(2)]
+        )
+
+    def forward(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """tokens: [N, 3, d] -> (summary [N, d], mean attention [2, 3, 3]).
+
+        summary = the final state of token position 0 (ego/H0)."""
+        mean_attns = []
+        for block in self.blocks:
+            tokens = block(tokens)
+            mean_attns.append(block.mean_attn)
+        return tokens[:, 0], torch.stack(mean_attns, dim=0)  # [2, 3, 3]

@@ -727,6 +727,126 @@ def _write_optimization_report(rows: list[dict]) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Hop-token attention stage (Prompt 6)
+# ---------------------------------------------------------------------------
+
+
+def _write_hop_attention_report() -> Path:
+    import statistics
+
+    HOP_ROOT = R2D25_ROOT / "hop_attention"
+    attn_rows = _collect_capacity_rows_from(HOP_ROOT)
+    base_rows = _collect_capacity()
+    if not attn_rows:
+        raise RuntimeError("no hop_attention summaries found — run "
+                           "perf_r2d25_capacity_train.py --out-root outputs/perf_r2d25/hop_attention")
+    from src.analysis.perf_r2_utils import load_a0_reference
+
+    a0_acc = load_a0_reference()
+    report = HOP_ROOT / "R2D25_HOP_ATTN_REPORT.md"
+    lines = ["# R2-D2.5-E — Mature hop-token attention (conditional)", "",
+             "Per-factor 3 hop tokens -> 2 Pre-LN blocks (d, 4 heads, FFN 4d,",
+             "dropout 0.1); ego/H0 token as query/summary; 2-layer fusion.",
+             "Capacity control: same architecture, 3 tokens from independent H1",
+             "transforms (h1_attention). Deltas per (dataset, seed), pp.",
+             ""]
+    by_attn: dict[tuple[str, str, int], dict] = {
+        (r["dataset"], r["variant"], r["seed"]): r for r in attn_rows}
+    by_base: dict[tuple[str, str, int], dict] = {
+        (r["dataset"], r["variant"], r["seed"]): r for r in base_rows}
+    for metric in ("val_acc", "val_macro_f1"):
+        lines.append(f"### {metric} deltas (M/T/G, 3-seed means)")
+        lines.append("")
+        lines.append("| comparison | Movies | Toys | Grocery | mean |")
+        lines.append("|---|---|---|---|---|")
+        for cmp_name, base_v in (("vs EARLY_MIX (B0 control)", "early_mix"),
+                                 ("vs h1_attention (capacity control)", "h1_attention")):
+            ds_means = []
+            for ds in TARGET_DATASETS:
+                deltas = [
+                    100.0 * (by_attn[(ds, "hop_attention", s)][metric]
+                             - by_base[(ds, base_v, s)][metric])
+                    for s in SEEDS
+                    if (ds, "hop_attention", s) in by_attn and (ds, base_v, s) in by_base
+                ]
+                ds_means.append(statistics.fmean(deltas) if deltas else float("nan"))
+            mean = statistics.fmean([d for d in ds_means if d == d]) if any(
+                d == d for d in ds_means) else float("nan")
+            lines.append(
+                f"| {cmp_name} | {ds_means[0]:+.2f} | {ds_means[1]:+.2f} | "
+                f"{ds_means[2]:+.2f} | {mean:+.2f} |")
+        lines.append("")
+    lines.append("### H2-off causal usage (full - h2_off, Val acc pp)")
+    lines.append("")
+    for ds in TARGET_DATASETS:
+        drops = []
+        for s in SEEDS:
+            r = by_attn.get((ds, "hop_attention", s))
+            if r and "abl_full_acc" in r and "abl_h2_off_acc" in r:
+                drops.append(100.0 * (r["abl_full_acc"] - r["abl_h2_off_acc"]))
+        if drops:
+            lines.append(f"- {ds}: {statistics.fmean(drops):+.3f}pp "
+                         f"({sum(1 for d in drops if d > 0)}/{len(drops)} seeds positive)")
+    lines.append("")
+    lines.append("### Attention weights (mean over nodes; rows=query, cols=key)")
+    lines.append("")
+    for ds in TARGET_DATASETS:
+        for s in SEEDS:
+            r = by_attn.get((ds, "hop_attention", s))
+            if not r or not r.get("attention_weights"):
+                continue
+            aw = r["attention_weights"]  # [6, 3] flat (3 factors x 2 layers)
+            lines.append(f"- {ds} s{s}:")
+            for f in range(3):
+                lay = aw[2 * f : 2 * f + 2]
+                lines.append(f"  - factor {f}: L1 " + " ".join(f"{v:.2f}" for v in lay[0])
+                             + " | L2 " + " ".join(f"{v:.2f}" for v in lay[1]))
+    lines.append("")
+    lines.append("Verdict: entered because SEP_CONCAT/INCEPTION beat WIDE_B0 by")
+    lines.append(">= +0.20pp (F1) while D2.5-B shows the late readout still limits")
+    lines.append("utilization. The capacity control isolates the value of cross-hop")
+    lines.append("token exchange from the added capacity itself.")
+    HOP_ROOT.mkdir(parents=True, exist_ok=True)
+    report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return report
+
+
+def _collect_capacity_rows_from(root: Path) -> list[dict]:
+    """Capacity-style summaries from an arbitrary root."""
+    rows = []
+    if not root.exists():
+        return rows
+    for ds_dir in sorted(root.iterdir()):
+        if not ds_dir.is_dir():
+            continue
+        for v_dir in sorted(ds_dir.iterdir()):
+            if not v_dir.is_dir():
+                continue
+            for s_dir in sorted(v_dir.iterdir()):
+                if not s_dir.is_dir():
+                    continue
+                p = s_dir / "summary.json"
+                if not p.exists():
+                    continue
+                d = json.loads(p.read_text())
+                row = {
+                    "dataset": ds_dir.name, "variant": d.get("variant", v_dir.name),
+                    "seed": int(s_dir.name.split("_")[-1]),
+                    "val_acc": d["best_val_acc"], "val_macro_f1": d["best_val_macro_f1"],
+                    "best_epoch": d.get("best_epoch"), "stop_epoch": d.get("stop_epoch"),
+                    "params": d.get("parameter_count"),
+                    "peak_mb": d.get("peak_allocated_mb"),
+                    "runtime_sec": d.get("runtime_sec"),
+                    "attention_weights": (d.get("diagnostics") or {}).get("attention_weights"),
+                }
+                for tag, m in d.get("ablations", {}).items():
+                    row[f"abl_{tag}_acc"] = m["val_acc"]
+                    row[f"abl_{tag}_f1"] = m["val_macro_f1"]
+                rows.append(row)
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Later stages (implemented with their prompts)
 # ---------------------------------------------------------------------------
 
@@ -823,7 +943,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="R2-Design-2.5 summarizer")
     parser.add_argument("--stage", default="audit",
                         choices=["audit", "landscape", "transmission", "capacity",
-                                 "optimization", "final"])
+                                 "optimization", "hop_attention", "final"])
     args = parser.parse_args()
     if args.stage == "audit":
         report = _write_audit_report(_collect_audit_facts())
@@ -840,6 +960,9 @@ def main() -> None:
         return
     if args.stage == "optimization":
         print(f"[optimization] wrote {_write_optimization_report(_collect_optimization())}")
+        return
+    if args.stage == "hop_attention":
+        print(f"[hop_attention] wrote {_write_hop_attention_report()}")
         return
     raise NotImplementedError(
         "stage=final is implemented at Prompt 7 (synthesis)")

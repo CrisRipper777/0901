@@ -123,7 +123,8 @@ def run_worker(dataset: str, seed: int, outdir: Path, force: bool) -> None:
         f_block, _ = model._parent_ctx(x, ei, num_nodes)
         exported = model.export_pair_scores(x, ei)
 
-    # ---- per-pair per-target statistics ------------------------------------
+    # ---- per-pair per-target statistics (CPU; exported tensors are CPU) -----
+    dst_c = dst.cpu()
     pair_rows = []
     for a in range(3):
         for b in range(3):
@@ -131,14 +132,13 @@ def run_worker(dataset: str, seed: int, outdir: Path, force: bool) -> None:
             stats = exported[key]
             s, alpha, null = stats["scores"], stats["alpha"], stats["null_mass"]
             # per-target aggregates via scatter
-            deg = torch.bincount(dst, minlength=num_nodes).float()
+            deg = torch.bincount(dst_c, minlength=num_nodes).float()
             # normalized entropy per target over {null} + neighbors
-            total = (alpha.new_zeros(num_nodes).scatter_add(0, dst, alpha)
-                     + null)
-            p_nei = alpha / (total[dst] + 1e-12)
+            total = alpha.new_zeros(num_nodes).scatter_add(0, dst_c, alpha) + null
+            p_nei = alpha / (total[dst_c] + 1e-12)
             p_null = null / (total + 1e-12)
             ent = -(p_nei * torch.log(p_nei + 1e-12)).new_zeros(num_nodes)
-            ent = ent.scatter_add(0, dst, -(p_nei * torch.log(p_nei + 1e-12)))
+            ent = ent.scatter_add(0, dst_c, -(p_nei * torch.log(p_nei + 1e-12)))
             ent = ent - p_null * torch.log(p_null + 1e-12)
             norm_ent = ent / (torch.log(deg + 1.0) + 1e-12)
             eff_count = torch.exp(ent)
@@ -201,15 +201,17 @@ def run_worker(dataset: str, seed: int, outdir: Path, force: bool) -> None:
             top_j = set(torch.topk(pair_scores[kj], k_top).indices.tolist())
             topk_overlap[i][j] = len(top_i & top_j) / k_top
 
-    # ---- heuristic correlations (pair 0->0 representative + per-pair) -------
+    # ---- heuristic correlations (CPU; exported scores are CPU) ---------------
+    src_c, dst_c = src.cpu(), dst.cpu()
+    f_block_c = f_block.cpu()
     corr_rows = []
     for a in range(3):
         for b in range(3):
             s = exported[f"pair_{a}{b}"]["scores"].float()
             cos_ab = torch.nn.functional.cosine_similarity(
-                f_block[dst, b], f_block[src, a], dim=-1)
-            src_deg = torch.bincount(src, minlength=num_nodes).float()[src]
-            dst_deg = torch.bincount(dst, minlength=num_nodes).float()[dst]
+                f_block_c[dst_c, b], f_block_c[src_c, a], dim=-1)
+            src_deg = torch.bincount(src_c, minlength=num_nodes).float()[src_c]
+            dst_deg = torch.bincount(dst_c, minlength=num_nodes).float()[dst_c]
             corr_rows.append({
                 "dataset": dataset, "seed": seed, "pair": f"pair_{a}{b}",
                 "corr_cos": float(torch.corrcoef(torch.stack([s, cos_ab]))[0, 1].item()),
@@ -219,32 +221,29 @@ def run_worker(dataset: str, seed: int, outdir: Path, force: bool) -> None:
 
     # ---- train-label-only homophily (train->train edges only) --------------
     train_set = set(int(i) for i in setup.data.train_idx.tolist())
-    src_tr = torch.tensor([int(v) for v in src.tolist() if v in train_set],
-                          device=device)
-    dst_tr = torch.tensor([int(v) for v in dst.tolist() if v in train_set],
-                          device=device)
     y = setup.data.y.to(device)
+    # edge-correspondence-preserving train-train mask (NOT per-endpoint filters)
+    mask = torch.tensor([int(v) in train_set for v in src.tolist()]) \
+        & torch.tensor([int(v) in train_set for v in dst.tolist()])
+    src_tt = torch.tensor([int(v) for v in src.tolist()])[mask]
+    dst_tt = torch.tensor([int(v) for v in dst.tolist()])[mask]
+    same_tt = (y[src_tt.to(device)] == y[dst_tt.to(device)]).cpu()
     homo_rows = []
     for a in range(3):
         for b in range(3):
             s_all = exported[f"pair_{a}{b}"]["scores"].cpu().float()
-            same = (y[src_tr] == y[dst_tr])
-            # map back: train->train edges only
-            mask = torch.tensor([int(v) in train_set for v in src.tolist()]) \
-                & torch.tensor([int(v) in train_set for v in dst.tolist()])
+            alpha_all = exported[f"pair_{a}{b}"]["alpha"].cpu().float()
             s_tt = s_all[mask]
-            same_tt = same
+            a_tt = alpha_all[mask]
             homo_rows.append({
                 "dataset": dataset, "seed": seed, "pair": f"pair_{a}{b}",
                 "same_label_mean_score": float(s_tt[same_tt].mean().item())
                 if same_tt.any() else None,
                 "diff_label_mean_score": float(s_tt[~same_tt].mean().item())
                 if (~same_tt).any() else None,
-                "same_label_mean_alpha": float(
-                    exported[f"pair_{a}{b}"]["alpha"].cpu().float()[mask][same_tt].mean().item())
+                "same_label_mean_alpha": float(a_tt[same_tt].mean().item())
                 if same_tt.any() else None,
-                "diff_label_mean_alpha": float(
-                    exported[f"pair_{a}{b}"]["alpha"].cpu().float()[mask][~same_tt].mean().item())
+                "diff_label_mean_alpha": float(a_tt[~same_tt].mean().item())
                 if (~same_tt).any() else None,
             })
 

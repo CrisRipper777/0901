@@ -38,6 +38,11 @@ from .biaxis_r2_neighbor_utility_components import (
     PairTransform,
     chunked_pair_message,
 )
+from .biaxis_r2_relfunc_components import (
+    chunked_coupled_message,
+    per_target_edge_mask,
+    shuffle_scores_within_target,
+)
 
 FACTOR_NAMES = ("C", "Pt", "Pv")
 
@@ -54,6 +59,7 @@ MODES = (
     "target_factor_only",
     "pair_transform_uniform",
     "pair_transform_pre",
+    "coupled_equiv",
 )
 
 # pair list per mode: (a, b) row-major over source a -> target b
@@ -66,7 +72,15 @@ CAUSAL_OVERRIDES = (
     "remove_random_10", "remove_random_25", "remove_random_50",
     "remove_bottom_10", "remove_bottom_25", "remove_bottom_50",
     "keep_top_25", "keep_top_50",
-    "within_target_shuffle", "source_shuffle", "factor_id_shuffle",
+    # D2.8 v2 repaired causal machinery (§5): the shuffle below is the fixed
+    # exact integer-segment permutation (the float composite key is gone);
+    # per-target removal selects inside each target's own neighborhood.
+    "within_target_shuffle", "within_target_shuffle_fixed",
+    "remove_top_per_target_10", "remove_top_per_target_25", "remove_top_per_target_50",
+    "remove_random_per_target_10", "remove_random_per_target_25", "remove_random_per_target_50",
+    "remove_bottom_per_target_10", "remove_bottom_per_target_25", "remove_bottom_per_target_50",
+    "keep_top_per_target_25", "keep_top_per_target_50",
+    "source_shuffle", "factor_id_shuffle",
     "noise_10", "noise_25",
 )
 
@@ -110,7 +124,8 @@ class Model(nn.Module):
         self.scorer: FactorPairScorer | None = None
         self.generic_scorer: GenericEdgeScorer | None = None
         self.local_proj: nn.Linear | None = None
-        if self.mode in ("pair_edge", "diag_edge", "post_pair", "pair_transform_pre"):
+        if self.mode in ("pair_edge", "diag_edge", "post_pair", "pair_transform_pre",
+                         "coupled_equiv"):
             self.scorer = FactorPairScorer(d, self.type_dim, dropout, activation, norm)
         elif self.mode == "generic_edge":
             # width solved so scorer params match PAIR_EDGE's psi within +/-5%
@@ -312,6 +327,25 @@ class Model(nn.Module):
             return self._weighted_messages(f_block, edge_index, num_nodes,
                                            payloads, s, causal)
 
+        if mode == "coupled_equiv":
+            # D2.8 v2 §5.3: explicit r*pi factorization of PAIR_EDGE using the
+            # same edge/null logits (COUPLED_EQUIV bridge). Never trained;
+            # used to verify max|m_coupled - m_pair_edge| < 1e-6.
+            msgs = []
+            for b in range(3):
+                acc = None
+                for a in range(3):
+                    pa, pb = pair_perm[(a, b)]
+                    s = self._pair_scores_chunked(f_block, edge_index, pa, pb,
+                                                  num_edges)
+                    null = self._null_scores(f_block, a, b)
+                    m_ab = chunked_coupled_message(
+                        f_block, edge_index, num_nodes, s, null, payloads[a],
+                        edge_chunk_size=self.edge_chunk_size)
+                    acc = m_ab if acc is None else acc + m_ab
+                msgs.append(acc / 3.0)
+            return torch.stack(msgs, dim=1)
+
         if mode in ("pair_edge", "pair_transform_pre", "semantic_sim",
                     "diag_edge", "source_factor_only", "target_factor_only"):
             pairs = DIAG_PAIRS if mode == "diag_edge" else ALL_PAIRS
@@ -348,10 +382,12 @@ class Model(nn.Module):
                 s = self._pair_scores_chunked(fb, ei, b, b, int(ei.size(1)))
             else:
                 s = self._pair_scores_chunked(fb, ei, pa, pb, int(ei.size(1)))
-            if causal == "within_target_shuffle":
+            if causal in ("within_target_shuffle", "within_target_shuffle_fixed"):
                 s = self._within_target_shuffle(s, ei, num_nodes, int(ei.size(1)))
             edge_mask = None
-            if causal.startswith(("remove", "keep")):
+            if causal.startswith(("remove", "keep")) and "_per_target_" in causal:
+                edge_mask = self._pair_mask_per_target(s, ei, num_nodes, causal)
+            elif causal.startswith(("remove", "keep")):
                 edge_mask = self._pair_mask(s, causal)
             null = self._null_scores(fb, a, b)
             pl = payload
@@ -416,21 +452,21 @@ class Model(nn.Module):
     def _within_target_shuffle(self, scores, edge_index, num_nodes, num_edges):
         """Permute the scores across each target's own neighbors (per pair):
         preserves per-target score histograms, destroys score-to-neighbor
-        correspondence. Implemented with two stable sorts."""
-        dst = edge_index[1]
-        generator = torch.Generator().manual_seed(MISMATCH_PERM_SEED)
-        r = torch.rand(num_edges, generator=generator).to(scores.device)
-        # sort edges by (dst, random r) and by (dst, score):
-        key_r = dst.to(torch.float32) * 1e7 + r
-        key_s = dst.to(torch.float32) * 1e7 + scores.detach() * 1e-3 + 1e-6
-        order_r = torch.argsort(key_r, stable=True)   # e -> position in (dst,r) order
-        order_s = torch.argsort(key_s, stable=True)   # e -> position in (dst,s) order
-        # score of e becomes the score of the edge at the same (dst,r)-position
-        # in the (dst,s)-sorted sequence
-        pos_of_e = torch.empty_like(order_r)
-        pos_of_e[order_r] = torch.arange(num_edges, device=scores.device)
-        scores_sorted = scores[order_s]
-        return scores_sorted[pos_of_e]
+        correspondence. D2.8 v2 §5.1 repair: exact integer-segment
+        permutation — the previous float32 composite key (dst.float()*1e7 +
+        tie_break) collided on large graphs and degenerated toward identity;
+        it is gone."""
+        return shuffle_scores_within_target(scores, edge_index,
+                                            MISMATCH_PERM_SEED)
+
+    def _pair_mask_per_target(self, scores, edge_index, num_nodes, causal):
+        """D2.8 v2 §5.2: per-target remove/keep — each target independently
+        has the requested fraction of ITS OWN real neighbors selected; the
+        null is preserved; the remaining real-neighbor composition is
+        renormalized by the softmax itself."""
+        op, pct = causal.split("_per_target_")
+        return per_target_edge_mask(scores, edge_index, num_nodes, op,
+                                    float(pct) / 100.0, MISMATCH_PERM_SEED)
 
     # ------------------------------------------------------------------
     # Framework interface

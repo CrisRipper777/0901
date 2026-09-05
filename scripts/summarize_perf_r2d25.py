@@ -887,7 +887,8 @@ def _write_final_synthesis() -> tuple[Path, Path, Path]:
     if (TRANSMISSION_ROOT / "scale_transmission.csv").exists():
         with (TRANSMISSION_ROOT / "scale_transmission.csv").open() as f:
             for r in csv.DictReader(f):
-                master_rows.append({"stage": "transmission", **r})
+                sub = r.pop("stage")
+                master_rows.append({"stage": "transmission", "sub_stage": sub, **r})
     if (CAPACITY_ROOT / "capacity_results.csv").exists():
         with (CAPACITY_ROOT / "capacity_results.csv").open() as f:
             for r in csv.DictReader(f):

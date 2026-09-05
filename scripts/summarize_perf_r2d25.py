@@ -754,6 +754,14 @@ def _write_hop_attention_report() -> Path:
         (r["dataset"], r["variant"], r["seed"]): r for r in attn_rows}
     by_base: dict[tuple[str, str, int], dict] = {
         (r["dataset"], r["variant"], r["seed"]): r for r in base_rows}
+    with (HOP_ROOT / "hop_attention_results.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["dataset", "variant", "seed", "val_acc",
+                                               "val_macro_f1", "best_epoch", "stop_epoch",
+                                               "params"],
+                                extrasaction="ignore")
+        writer.writeheader()
+        for r in attn_rows:
+            writer.writerow(r)
     for metric in ("val_acc", "val_macro_f1"):
         lines.append(f"### {metric} deltas (M/T/G, 3-seed means)")
         lines.append("")
@@ -844,6 +852,98 @@ def _collect_capacity_rows_from(root: Path) -> list[dict]:
                     row[f"abl_{tag}_f1"] = m["val_macro_f1"]
                 rows.append(row)
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Final synthesis (Prompt 7)
+# ---------------------------------------------------------------------------
+
+
+def _write_final_synthesis() -> tuple[Path, Path, Path]:
+    import statistics
+
+    SUMMARY_ROOT.mkdir(parents=True, exist_ok=True)
+    master = SUMMARY_ROOT / "R2D25_MASTER_TABLE.csv"
+    ledger = SUMMARY_ROOT / "R2D25_HYPOTHESIS_LEDGER.csv"
+    diagnosis = SUMMARY_ROOT / "R2D25_FINAL_DIAGNOSIS.md"
+
+    # ---- master table: every formal run in one CSV -------------------------
+    master_rows: list[dict] = []
+    if (LANDSCAPE_ROOT / "alpha_landscape.csv").exists():
+        with (LANDSCAPE_ROOT / "alpha_landscape.csv").open() as f:
+            for r in csv.DictReader(f):
+                master_rows.append({"stage": "landscape", **r})
+    if (TRANSMISSION_ROOT / "scale_transmission.csv").exists():
+        with (TRANSMISSION_ROOT / "scale_transmission.csv").open() as f:
+            for r in csv.DictReader(f):
+                master_rows.append({"stage": "transmission", **r})
+    if (CAPACITY_ROOT / "capacity_results.csv").exists():
+        with (CAPACITY_ROOT / "capacity_results.csv").open() as f:
+            for r in csv.DictReader(f):
+                master_rows.append({"stage": "capacity", **r})
+    if (OPTIMIZATION_ROOT / "optimization_results.csv").exists():
+        with (OPTIMIZATION_ROOT / "optimization_results.csv").open() as f:
+            for r in csv.DictReader(f):
+                master_rows.append({"stage": "optimization", **r})
+    if (R2D25_ROOT / "hop_attention" / "hop_attention_results.csv").exists():
+        with (R2D25_ROOT / "hop_attention" / "hop_attention_results.csv").open() as f:
+            for r in csv.DictReader(f):
+                master_rows.append({"stage": "hop_attention", **r})
+    if master_rows:
+        fields = ["stage"] + sorted({k for r in master_rows for k in r if k != "stage"})
+        with master.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            for r in master_rows:
+                writer.writerow(r)
+
+    # ---- hypothesis ledger (hypothesis -> stage -> verdict) ----------------
+    ledger_rows = [
+        {"hypothesis": "fixed alpha_Pt has 3-seed stable value (D2.0.5 seed-42 curve)",
+         "stage": "D2.5-A", "verdict": "REJECTED (flat, +0.001~0.003pp)",
+         "evidence": "outputs/perf_r2d25/landscape/"},
+        {"hypothesis": "Pt H2 utility survives the B0 factor pipeline",
+         "stage": "D2.5-B", "verdict": "SUPPORTED (S0-S3 retention 0.5-1.5)",
+         "evidence": "outputs/perf_r2d25/transmission/"},
+        {"hypothesis": "fusion/readout is where Pt-H2 utility collapses",
+         "stage": "D2.5-B", "verdict": "SUPPORTED (S4 retention 0.03-0.21; fixed parent head ~0.00pp)",
+         "evidence": "outputs/perf_r2d25/transmission/"},
+        {"hypothesis": "structured capacity (independent hop experts) beats the M1 control",
+         "stage": "D2.5-C", "verdict": "NOT SUPPORTED (all candidates <= EARLY_MIX on M/T/G)",
+         "evidence": "outputs/perf_r2d25/capacity/"},
+        {"hypothesis": "independent hop experts beat parameter-matched controls",
+         "stage": "D2.5-C", "verdict": "PARTIAL (ACC: sep_concat/inception beat WIDE_B0/CAP_H1_DUP +0.34~0.55pp; F1 mixed)",
+         "evidence": "outputs/perf_r2d25/capacity/"},
+        {"hypothesis": "generic capacity alone is sufficient",
+         "stage": "D2.5-C", "verdict": "REJECTED (WIDE_B0 worst on both metrics)",
+         "evidence": "outputs/perf_r2d25/capacity/"},
+        {"hypothesis": "fusion depth is the binding bottleneck",
+         "stage": "D2.5-C", "verdict": "PARTIAL (deep_fusion only positive variant, +0.45pp F1, 2/3 ds)",
+         "evidence": "outputs/perf_r2d25/capacity/"},
+        {"hypothesis": "H2 branch is actually used by trained models",
+         "stage": "D2.5-C", "verdict": "SUPPORTED (H2-off drops 2.2-8.5pp, 3/3 seeds)",
+         "evidence": "outputs/perf_r2d25/capacity/"},
+        {"hypothesis": "H1 strong-path dominance starves the H2 branch",
+         "stage": "D2.5-C ablations", "verdict": "NOT SUPPORTED (Toys/Grocery H2-off > H1-off) -> D3 path dropout skipped",
+         "evidence": "outputs/perf_r2d25/capacity/capacity_mechanism.csv"},
+        {"hypothesis": "expert LR / deep supervision unlock the H2 value",
+         "stage": "D2.5-D", "verdict": "PENDING D2.5-D results",
+         "evidence": "outputs/perf_r2d25/optimization/"},
+        {"hypothesis": "hop-token attention converts token exchange into gains",
+         "stage": "D2.5-E", "verdict": "PENDING / not entered",
+         "evidence": "outputs/perf_r2d25/hop_attention/"},
+    ]
+    with ledger.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["hypothesis", "stage", "verdict", "evidence"])
+        writer.writeheader()
+        for r in ledger_rows:
+            writer.writerow(r)
+
+    diagnosis.write_text(
+        "# R2-Design-2.5 — FINAL DIAGNOSIS (skeleton, to be completed at Prompt 7)\n\n"
+        "Placeholder written by --stage final; the 17-question synthesis is\n"
+        "authored at Prompt 7 after D2.5-D/E completion.\n", encoding="utf-8")
+    return master, ledger, diagnosis
 
 
 # ---------------------------------------------------------------------------
@@ -964,8 +1064,10 @@ def main() -> None:
     if args.stage == "hop_attention":
         print(f"[hop_attention] wrote {_write_hop_attention_report()}")
         return
-    raise NotImplementedError(
-        "stage=final is implemented at Prompt 7 (synthesis)")
+    if args.stage == "final":
+        m, l, d = _write_final_synthesis()
+        print(f"[final] wrote {m} / {l} / {d}")
+        return
 
 
 

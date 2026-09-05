@@ -322,37 +322,49 @@ class Model(nn.Module):
                     if (a, b) not in pairs:
                         continue
                     pa, pb = pair_perm[(a, b)]
-                    if mode == "semantic_sim":
-                        s = self._cos_scores(f_block, edge_index, pa, pb, num_edges)
-                    elif mode == "source_factor_only":
-                        s = self._pair_scores_chunked(
-                            f_block, edge_index, a, a, num_edges)  # a-dependent only
-                    elif mode == "target_factor_only":
-                        s = self._pair_scores_chunked(
-                            f_block, edge_index, b, b, num_edges)  # b-dependent only
-                    else:
-                        s = self._pair_scores_chunked(
-                            f_block, edge_index, pa, pb, num_edges)
-                    if causal == "within_target_shuffle":
-                        s = self._within_target_shuffle(s, edge_index, num_nodes,
-                                                        num_edges)
-                    edge_mask = None
-                    if causal.startswith(("remove", "keep")):
-                        edge_mask = self._pair_mask(s, causal)
-                    null = self._null_scores(f_block, a, b)
                     payload = payloads[a]
-                    if mode == "pair_transform_pre":
-                        payload = self.pair_transform(f_block[:, a], a, b)
-                    m_ab = chunked_pair_message(
-                        f_block, edge_index, num_nodes, s, null, payload,
-                        edge_chunk_size=self.edge_chunk_size,
-                        edge_mask=edge_mask)
+                    m_ab = self._pair_message_ckpt(
+                        f_block, edge_index, num_nodes, num_edges,
+                        a, b, pa, pb, payload, causal)
                     acc = m_ab if acc is None else acc + m_ab
                 msgs.append(acc / 3.0 if acc is not None else torch.zeros(
                     num_nodes, d, dtype=f_block.dtype, device=f_block.device))
             return torch.stack(msgs, dim=1)
 
         raise ValueError(f"mode={mode} has no side message path")
+
+    def _pair_message_ckpt(self, f_block, edge_index, num_nodes, num_edges,
+                           a, b, pa, pb, payload, causal):
+        """One factor-pair message computation. Activation-checkpointed in
+        any grad-enabled pass (the chunked intermediates of all 9 pairs
+        would otherwise coexist until backward — ~21GB on ele-fashion)."""
+
+        def _run(fb, ei):
+            if self.mode == "semantic_sim":
+                s = self._cos_scores(fb, ei, pa, pb, int(ei.size(1)))
+            elif self.mode == "source_factor_only":
+                s = self._pair_scores_chunked(fb, ei, a, a, int(ei.size(1)))
+            elif self.mode == "target_factor_only":
+                s = self._pair_scores_chunked(fb, ei, b, b, int(ei.size(1)))
+            else:
+                s = self._pair_scores_chunked(fb, ei, pa, pb, int(ei.size(1)))
+            if causal == "within_target_shuffle":
+                s = self._within_target_shuffle(s, ei, num_nodes, int(ei.size(1)))
+            edge_mask = None
+            if causal.startswith(("remove", "keep")):
+                edge_mask = self._pair_mask(s, causal)
+            null = self._null_scores(fb, a, b)
+            pl = payload
+            if self.mode == "pair_transform_pre":
+                pl = self.pair_transform(fb[:, a], a, b)
+            return chunked_pair_message(
+                fb, ei, num_nodes, s, null, pl,
+                edge_chunk_size=self.edge_chunk_size, edge_mask=edge_mask)
+
+        if self.training or torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(
+                _run, f_block, edge_index, use_reentrant=False)
+        return _run(f_block, edge_index)
 
     def _weighted_messages(self, f_block, edge_index, num_nodes, payloads,
                            s, causal):
@@ -424,6 +436,19 @@ class Model(nn.Module):
     # Framework interface
     # ------------------------------------------------------------------
 
+    def _augment_edges(self, edge_index, num_nodes, causal):
+        """Eval-time random-edge injection for the SIDE branch only
+        (D2.7-F stress test, plan §46): noise_10 / noise_25 append random
+        node pairs to a COPY of the observed edge list. The parent path
+        always consumes the original graph."""
+        pct = int(causal.split("_")[1]) / 100.0
+        generator = torch.Generator().manual_seed(MISMATCH_PERM_SEED)
+        n_add = max(1, int(edge_index.size(1) * pct))
+        src_r = torch.randint(0, num_nodes, (n_add,), generator=generator).to(edge_index.device)
+        dst_r = torch.randint(0, num_nodes, (n_add,), generator=generator).to(edge_index.device)
+        noise = torch.stack([src_r, dst_r])
+        return torch.cat([edge_index, noise], dim=1)
+
     def forward(self, x, edge_index=None, causal="full"):
         assert causal in CAUSAL_OVERRIDES, causal
         if edge_index is None:
@@ -432,7 +457,10 @@ class Model(nn.Module):
         f_block, z_base = self._parent_ctx(x, edge_index, num_nodes)
         if causal == "side_off" or self.mode == "a0_base":
             return z_base, None, None, x.new_tensor(0.0), {}
-        m = self._side_messages(f_block, edge_index, num_nodes, causal)
+        side_ei = edge_index
+        if causal.startswith("noise_"):
+            side_ei = self._augment_edges(edge_index, num_nodes, causal)
+        m = self._side_messages(f_block, side_ei, num_nodes, causal)
         z = torch.cat([z_base, m[:, 0], m[:, 1], m[:, 2]], dim=-1)
         return z, None, None, x.new_tensor(0.0), {}
 
@@ -547,6 +575,50 @@ class Model(nn.Module):
                         if num_edges > 2 else 0.0),
                 }
         return out
+
+    @torch.no_grad()
+    def injected_edge_utility(self, x, edge_index, pct: float) -> dict:
+        """D2.7-F diagnostics: alpha mass assigned to INJECTED random edges
+        vs original edges (mean over the 9 pairs), plus the injected edges'
+        share of each pair's top-10%/top-25% alpha."""
+        self.eval()
+        num_nodes = int(x.size(0))
+        f_block, _ = self._parent_ctx(x, edge_index, num_nodes)
+        aug = self._augment_edges(edge_index, num_nodes, f"noise_{int(pct)}")
+        n_orig = int(edge_index.size(1))
+        n_add = int(aug.size(1)) - n_orig
+        inj_alpha, orig_alpha = [], []
+        inj_top10, inj_top25 = 0, 0
+        for a in range(3):
+            for b in range(3):
+                if self.mode == "diag_edge" and a != b:
+                    continue
+                s = self._pair_scores_chunked(f_block, aug, a, b, int(aug.size(1)))
+                stats_alpha = self._alpha_from_scores(f_block, aug, num_nodes, a, b, s)
+                inj_alpha.append(stats_alpha[n_orig:].mean().item())
+                orig_alpha.append(stats_alpha[:n_orig].mean().item())
+                top10_q = torch.quantile(stats_alpha, 0.90)
+                top25_q = torch.quantile(stats_alpha, 0.75)
+                inj_top10 += int((stats_alpha[n_orig:] >= top10_q).sum().item())
+                inj_top25 += int((stats_alpha[n_orig:] >= top25_q).sum().item())
+        return {
+            "injected_mean_alpha": float(sum(inj_alpha) / len(inj_alpha)),
+            "original_mean_alpha": float(sum(orig_alpha) / len(orig_alpha)),
+            "injected_frac_top10": inj_top10 / max(9 * n_add, 1),
+            "injected_frac_top25": inj_top25 / max(9 * n_add, 1),
+        }
+
+    def _alpha_from_scores(self, f_block, edge_index, num_nodes, a, b, s):
+        """alpha per edge for pair (a,b) given precomputed scores."""
+        dst = edge_index[1]
+        null = self._null_scores(f_block, a, b)
+        max_i = torch.zeros(num_nodes, dtype=s.dtype, device=s.device)
+        seg_max = torch.zeros(num_nodes, dtype=s.dtype, device=s.device)
+        seg_max = seg_max.scatter_reduce(0, dst, s, reduce="amax", include_self=False)
+        max_i = torch.maximum(max_i, seg_max)
+        denom = torch.exp(null - max_i)
+        denom = denom.scatter_add(0, dst, torch.exp(s - max_i[dst]))
+        return torch.exp(s - max_i[dst]) / denom[dst]
 
     @torch.no_grad()
     def export_pair_scores(self, x, edge_index) -> dict:

@@ -536,34 +536,43 @@ def _write_ownership_report() -> Path:
             writer.writerow(r)
     pair = _by_key(rows, "PAIR_EDGE")
     controls = {}
+    control_abs = {}
     for name in ("NODE_SHARED", "FACTOR_DIAG", "SOURCE_FACTOR_ONLY", "TARGET_FACTOR_ONLY"):
         key = {"NODE_SHARED": "GENERIC_EDGE", "FACTOR_DIAG": "DIAG_EDGE"}.get(name, name)
-        controls[name] = _paired(pair, _by_key(rows, key), "val_acc",
-                                 TARGET_DATASETS, SEEDS)
-        controls[name]["f1"] = _paired(pair, _by_key(rows, key), "val_macro_f1",
+        c_rows = _by_key(rows, key)
+        controls[name] = _paired(pair, c_rows, "val_acc", TARGET_DATASETS, SEEDS)
+        controls[name]["f1"] = _paired(pair, c_rows, "val_macro_f1",
                                        TARGET_DATASETS, SEEDS)
-    strongest = max(controls.values(), key=lambda c: c["mean"] or -1e9)
+        accs = [r["val_acc"] for (ds, s), r in c_rows.items()
+                if ds in TARGET_DATASETS]
+        control_abs[name] = statistics.fmean(accs) if accs else None
+    # strongest control = the control with the HIGHEST absolute M/T/G acc
+    # (the one hardest to beat), per plan §38.
+    strongest_name = max(control_abs, key=lambda n: control_abs[n] or -1e9)
+    strongest = controls[strongest_name]
     report = OWNERSHIP_ROOT / "R2D27_OWNERSHIP_REPORT.md"
     lines = ["# R2-D2.7-D — Ownership-specificity audit", "",
-             "PAIR_EDGE vs the strongest factor-conditioned control. M/T/G", ""]
+             "PAIR_EDGE vs the factor-conditioned controls. M/T/G 3-seed means.", ""]
     for name, c in controls.items():
         lines.append(
             f"- vs {name}: Acc {c['mean'] if c['mean'] is None else f'{c['mean']:+.3f}'} "
             f"/ F1 {c['f1']['mean'] if c['f1']['mean'] is None else f'{c['f1']['mean']:+.3f}'} "
-            f"({c['n_pos']}/3)")
+            f"(abs acc {control_abs[name]:.5f}) ({c['n_pos']}/3)")
     support = (strongest["mean"] is not None and strongest["mean"] >= 0.20
                and strongest["f1"]["mean"] is not None
                and strongest["f1"]["mean"] >= 0.0 and strongest["n_pos"] >= 2)
     lines.append("")
+    lines.append(f"Strongest control by absolute Acc = **{strongest_name}**.")
     lines.append(f"**Full factor-pair ownership SUPPORTED: "
                  f"{'YES' if support else 'NO'}** (needs >= +0.20pp Acc over the "
                  "strongest control with F1 nonnegative and >=2/3 datasets, "
                  "plus D2.7-B pair-ranking divergence).")
     if not support:
         lines.append("")
-        lines.append("If generic edge selection works but PAIR has no advantage,")
-        lines.append("the conclusion must read: \"neighbor utility supported;")
-        lines.append("semantic-ownership factor-pair specificity not supported.\"")
+        lines.append("Per plan §38 the conclusion must read: \"neighbor utility")
+        lines.append("supported (vs generic/diag); semantic-ownership factor-pair")
+        lines.append("specificity not supported\" — the simpler factor-conditioned")
+        lines.append("formulation (TARGET_FACTOR_ONLY) matches the full 9-pair model.")
     report.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return report
 
@@ -655,6 +664,64 @@ def _write_final_synthesis() -> tuple[Path, Path, Path]:
             writer.writeheader()
             for r in master_rows:
                 writer.writerow(r)
+    ledger_rows = [
+        {"hypothesis": "observed topology as useful support",
+         "stage": "D2.7-A/B", "verdict": "SUPPORTED (source_shuffle drops 4.73pp)",
+         "evidence": "outputs/perf_r2d27/"},
+        {"hypothesis": "uniform neighbor aggregation is enough",
+         "stage": "D2.7-A", "verdict": "REJECTED (PAIR-UNIFORM +0.361 Acc / +0.245 F1)",
+         "evidence": "outputs/perf_r2d27/matrix/"},
+        {"hypothesis": "target-only graph-mass control explains selection",
+         "stage": "D2.7-A", "verdict": "PARTIAL (PAIR-TARGET_NULL +0.284 Acc but -0.493 F1: mass control explains F1, not Acc)",
+         "evidence": "outputs/perf_r2d27/matrix/"},
+        {"hypothesis": "generic edge utility suffices",
+         "stage": "D2.7-A", "verdict": "REJECTED (PAIR-GENERIC +0.452 Acc / +0.391 F1, 3/3)",
+         "evidence": "outputs/perf_r2d27/matrix/"},
+        {"hypothesis": "factor-pair (9-cell) neighbor utility",
+         "stage": "D2.7-A/D", "verdict": "CONDITIONAL — beats generic/diag but NOT TARGET_FACTOR_ONLY (+0.044 Acc / -0.349 F1) -> specificity NOT supported",
+         "evidence": "outputs/perf_r2d27/ownership/"},
+        {"hypothesis": "pre-aggregation timing matters",
+         "stage": "D2.7-C", "verdict": "PARTIAL (PRE-POST +0.326 Acc / -0.153 F1; Acc-side only)",
+         "evidence": "outputs/perf_r2d27/prepost/"},
+        {"hypothesis": "semantic similarity is a sufficient edge score",
+         "stage": "D2.7-A", "verdict": "REJECTED as sufficient (PAIR-SEM_SIM +0.271 Acc); corr(score,cos)=0.341 (not identity)",
+         "evidence": "outputs/perf_r2d27/"},
+        {"hypothesis": "null neighbor option is meaningful",
+         "stage": "D2.7-B", "verdict": "SUPPORTED (null mass mean 0.189, not 0/1 collapsed)",
+         "evidence": "outputs/perf_r2d27/edge_audit/"},
+        {"hypothesis": "within-neighborhood utility heterogeneity (neighbor IDENTITY) matters",
+         "stage": "D2.7-B", "verdict": "STRONGLY REJECTED — within-target shuffle drop = 0.000pp (M/T/G, and T3: 9/9 zero); noise edges get >= average alpha",
+         "evidence": "outputs/perf_r2d27/edge_audit/"},
+        {"hypothesis": "factor-pair ranking diversity",
+         "stage": "D2.7-B", "verdict": "SUPPORTED structurally (off-diag Spearman 0.156, JSD 0.23) but carries no performance value (see identity rejection)",
+         "evidence": "outputs/perf_r2d27/edge_audit/"},
+        {"hypothesis": "H2/multihop as downstream symptom",
+         "stage": "D2.7-G", "verdict": "OPEN — D2.5/D2.6 H2 findings reinterpreted: post-aggregation utility was mass/concentration, not identity",
+         "evidence": "synthesis"},
+        {"hypothesis": "selection-only transfer",
+         "stage": "D2.7-E", "verdict": "SUPPORTED (T1-T0 +0.361 Acc / +0.245 F1)",
+         "evidence": "outputs/perf_r2d27/transfer/"},
+        {"hypothesis": "pair-specific message transform",
+         "stage": "D2.7-E", "verdict": "NOT SUPPORTED as pair-specific (T2-T0 -0.032 Acc / +0.753 F1)",
+         "evidence": "outputs/perf_r2d27/transfer/"},
+        {"hypothesis": "selection x transform complementarity (functional transfer)",
+         "stage": "D2.7-E", "verdict": "CLOSED (T3-max(T1,T2) -0.325 Acc / +0.021 F1)",
+         "evidence": "outputs/perf_r2d27/transfer/"},
+        {"hypothesis": "A0 incremental utility",
+         "stage": "D2.7-A", "verdict": "STRONGLY_SUPPORTED (PAIR-A0_MATCHED +0.496 Acc / +0.790 F1, 3/3, guards safe) — first A0 increment in the R2 series",
+         "evidence": "outputs/perf_r2d27/matrix/"},
+        {"hypothesis": "noise-edge rejection",
+         "stage": "D2.7-F", "verdict": "NOT SUPPORTED (injected edges get >= average alpha on 2/3 datasets; PAIR degrades similarly to UNIFORM)",
+         "evidence": "outputs/perf_r2d27/noise_optional/"},
+        {"hypothesis": "RoleMAG / TMTE / CoMAG collisions",
+         "stage": "D2.7-0", "verdict": "CLOSED (guardrails implemented + tested)",
+         "evidence": "outputs/perf_r2d27/audit/"},
+    ]
+    with ledger.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["hypothesis", "stage", "verdict", "evidence"])
+        writer.writeheader()
+        for r in ledger_rows:
+            writer.writerow(r)
     if not diagnosis.exists() or "skeleton" in diagnosis.read_text():
         diagnosis.write_text(
             "# R2-Design-2.7 — FINAL DIAGNOSIS (skeleton)\n\n"

@@ -246,13 +246,22 @@ class Model(nn.Module):
                 return out
         return h2_eff
 
+    def _ckpt(self, module, *args):
+        """Activation checkpointing for the side branches (train only).
+        Numerically identical (use_reentrant=False — the house-tested
+        pattern from the OFR memory checkpoint)."""
+        if self.training:
+            return torch.utils.checkpoint.checkpoint(module, *args, use_reentrant=False)
+        return module(*args)
+
     def _expert_tokens(self, h0, h1, h2_eff, causal):
         """{key: [N, 3, d]} expert outputs (with gradients in training)."""
         tokens: dict[str, torch.Tensor] = {}
         for key in self.token_keys:
             src = self._token_source_tensor(key, h0, h1, h2_eff, causal)
             e = torch.stack(
-                [self.hop_experts[key][f](src[:, f]) for f in range(3)], dim=1)
+                [self._ckpt(self.hop_experts[key][f], src[:, f]) for f in range(3)],
+                dim=1)
             if causal == "h2_zero" and key == self.token_keys[-1]:
                 e = torch.zeros_like(e)
             if causal == "h2_off" and key == self.token_keys[-1]:
@@ -275,7 +284,7 @@ class Model(nn.Module):
         attns = []
         for f in range(3):
             toks = torch.stack([tokens[k][:, f] for k in keys], dim=1)  # [N, 3, d]
-            summary, attn = self.factor_hop_attns[f](toks)
+            summary, attn = self._ckpt(self.factor_hop_attns[f], toks)
             summaries.append(summary)
             attns.append(attn)
         return torch.stack(summaries, dim=1), torch.stack(attns, dim=0)
@@ -309,7 +318,7 @@ class Model(nn.Module):
         if rt == "base_anchored_hier_attention":
             q = torch.stack([self.factor_projs[f](s[:, f]) for f in range(3)], dim=1)
             tokens4 = torch.stack([z_base, q[:, 0], q[:, 1], q[:, 2]], dim=1)  # [N,4,h]
-            final, _attn = self.cross_attn(tokens4)
+            final, _attn = self._ckpt(self.cross_attn, tokens4)
             return z_base + self.w_out(final[:, 0] - z_base)
         # readout_only_control
         return z_base + self.readout_mlp(z_base)

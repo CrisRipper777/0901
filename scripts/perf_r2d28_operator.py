@@ -116,13 +116,20 @@ def run_worker(dataset: str, variant: str, seed: int, outdir: Path,
     cfg = resolve_cfg(dataset, seed, overrides)
     model = build_model(cfg, data, setup.parent, device)
 
-    # Rule V: load + freeze E*, C*, M*
+    # Rule V: load + freeze E*, C*, M* (NO-GO slots with no module params are
+    # skipped — e.g. C0 uniform / M0 mean have no modules)
     e_ckpt = EXPOSURE_ROOT / dataset / exposure_variant / f"seed_{seed}" / "best.pt"
     c_ckpt = COMPOSITION_ROOT / dataset / composition_variant / f"seed_{seed}" / "best.pt"
     m_ckpt = CHANNEL_ROOT / dataset / channel_variant / f"seed_{seed}" / "best.pt"
-    load_info = (load_frozen_components(model, e_ckpt, exposure_prefixes())
-                 | load_frozen_components(model, c_ckpt, composition_prefixes())
-                 | load_frozen_components(model, m_ckpt, channel_prefixes()))
+    c_prefixes = (composition_prefixes()
+                  if model.composition_kind != "uniform" else [])
+    m_prefixes = (channel_prefixes() if model.channel_kind != "mean" else [])
+    copied = load_frozen_components(model, e_ckpt, exposure_prefixes())["copied_params"]
+    if c_prefixes:
+        copied += load_frozen_components(model, c_ckpt, c_prefixes)["copied_params"]
+    if m_prefixes:
+        copied += load_frozen_components(model, m_ckpt, m_prefixes)["copied_params"]
+    load_info = {"copied_params": copied}
     model._apply_freezes()
 
     head = load_or_make_head_init(

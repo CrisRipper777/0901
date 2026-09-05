@@ -87,11 +87,15 @@ def run_worker(dataset: str, variant: str, seed: int, outdir: Path,
     cfg = resolve_cfg(dataset, seed, overrides)
     model = build_model(cfg, data, setup.parent, device)
 
-    # Rule V: load + freeze E* and C*
+    # Rule V: load + freeze E* and C* (NO-GO slots with no module params are
+    # skipped — e.g. C0 uniform has no composition modules)
     e_ckpt = EXPOSURE_ROOT / dataset / exposure_variant / f"seed_{seed}" / "best.pt"
     c_ckpt = COMPOSITION_ROOT / dataset / composition_variant / f"seed_{seed}" / "best.pt"
     load_info_e = load_frozen_components(model, e_ckpt, exposure_prefixes())
-    load_info_c = load_frozen_components(model, c_ckpt, composition_prefixes())
+    c_prefixes = (composition_prefixes()
+                  if model.composition_kind != "uniform" else [])
+    load_info_c = load_frozen_components(model, c_ckpt, c_prefixes) \
+        if c_prefixes else {"copied_params": 0}
     model._apply_freezes()
 
     head = load_or_make_head_init(

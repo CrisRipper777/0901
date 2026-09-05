@@ -149,7 +149,12 @@ def load_frozen_components(model: nn.Module, ckpt_path: Path,
     copied = 0
     for prefix in prefixes:
         matched = {k: v for k, v in state.items() if k.startswith(prefix)}
-        assert matched, f"no keys for prefix {prefix!r} in {ckpt_path}"
+        if not matched:
+            # NO-GO slot: neither the checkpoint nor the model has modules
+            # for this prefix (e.g. E0 fixed_full has no exposure_net)
+            assert not any(k.startswith(prefix) for k in model_state), \
+                f"model has {prefix!r} keys but {ckpt_path} does not"
+            continue
         for k, v in matched.items():
             if k in model_state and model_state[k].shape == v.shape:
                 model_state[k] = v

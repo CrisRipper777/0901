@@ -247,10 +247,10 @@ class Model(nn.Module):
         return h2_eff
 
     def _ckpt(self, module, *args):
-        """Activation checkpointing for the side branches (train only).
-        Numerically identical (use_reentrant=False — the house-tested
-        pattern from the OFR memory checkpoint)."""
-        if self.training:
+        """Activation checkpointing for the side branches (training and any
+        grad-enabled pass). Numerically identical (use_reentrant=False —
+        the house-tested pattern from the OFR memory checkpoint)."""
+        if self.training or torch.is_grad_enabled():
             return torch.utils.checkpoint.checkpoint(module, *args, use_reentrant=False)
         return module(*args)
 
@@ -450,9 +450,11 @@ class Model(nn.Module):
             tokens = self._expert_tokens(h0, h1, h2, "full")
             s, _ = self._factor_summaries(tokens)
             z = self._readout(z_base, tokens, "full", s=s)
+            # ONE grad call for the whole [N, 3, d] summaries tensor — no
+            # retain_graph (keeps the peak small on large graphs).
+            g = torch.autograd.grad(z.pow(2).sum(), s)[0]
             out = {}
             for f, name in enumerate(FACTOR_NAMES):
-                g = torch.autograd.grad(z.pow(2).sum(), s, retain_graph=True)[0]
                 out[f"s_{name}"] = float(g[:, f].norm().item())
         return out
 

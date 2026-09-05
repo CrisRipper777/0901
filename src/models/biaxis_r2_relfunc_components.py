@@ -453,9 +453,16 @@ class _PreLNAttnBlock(nn.Module):
     def __init__(self, d: int, num_heads: int = 4, dropout: float = 0.1,
                  ffn_mult: int = 4) -> None:
         super().__init__()
+        assert d % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = d // num_heads
+        # hand-rolled MHA (nn.MultiheadAttention's internal SDPA dispatch
+        # raises "invalid configuration argument" at ele-fashion batch size
+        # 97K x 4 tokens; explicit matmuls keep full control)
+        self.qkv = nn.Linear(d, 3 * d)
+        self.out_proj = nn.Linear(d, d)
+        self.drop_attn = nn.Dropout(dropout)
         self.ln1 = nn.LayerNorm(d)
-        self.attn = nn.MultiheadAttention(d, num_heads, dropout=dropout,
-                                          batch_first=True)
         self.drop1 = nn.Dropout(dropout)
         self.ln2 = nn.LayerNorm(d)
         self.ffn = nn.Sequential(
@@ -467,11 +474,18 @@ class _PreLNAttnBlock(nn.Module):
         self.drop2 = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, return_attn: bool = False):
-        h = self.ln1(x)
-        h, w = self.attn(h, h, h, need_weights=return_attn)
-        x = x + self.drop1(h)
+        b, l, d = x.shape
+        q, k, v = self.qkv(self.ln1(x)).chunk(3, dim=-1)
+        q = q.view(b, l, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(b, l, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(b, l, self.num_heads, self.head_dim).transpose(1, 2)
+        scale = self.head_dim ** -0.5
+        w = torch.softmax(q @ k.transpose(-1, -2) * scale, dim=-1)
+        w = self.drop_attn(w)
+        h = (w @ v).transpose(1, 2).reshape(b, l, d)
+        x = x + self.drop1(self.out_proj(h))
         x = x + self.drop2(self.ffn(self.ln2(x)))
-        return x, (w if return_attn else None)
+        return x, (w.mean(dim=1) if return_attn else None)
 
 
 class SourceAttnMixer(nn.Module):

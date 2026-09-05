@@ -631,7 +631,18 @@ class Model(nn.Module):
                                              s, causal)
                 r = self._r_for_pair(rvals, pa, pb)
                 m_ab.append(m0 if r is None else r.unsqueeze(-1) * m0)
-            msgs.append(self._channel_mix(f_block, m_ab, b))
+            if self.channel_kind == "attn" and \
+                    (self.training or torch.is_grad_enabled()):
+                # attention activations at ele-fashion batch size (97K) are
+                # ~10GB+; checkpoint the mixer like the pair messages
+                def _mix(fb, m0, m1, m2, bb):
+                    return self._channel_mix(fb, [m0, m1, m2], bb)
+
+                msgs.append(torch.utils.checkpoint.checkpoint(
+                    _mix, f_block, m_ab[0], m_ab[1], m_ab[2], b,
+                    use_reentrant=False))
+            else:
+                msgs.append(self._channel_mix(f_block, m_ab, b))
             if return_components:
                 for a in range(3):
                     components["m_ab"][(a, b)] = m_ab[a]

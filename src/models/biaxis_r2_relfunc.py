@@ -619,8 +619,13 @@ class Model(nn.Module):
             m_ab = []
             for a in range(3):
                 pa, pb = pair_perm[(a, b)]
-                s = self._comp_scores_for_pair(f_block, edge_index, pa, pb,
-                                               num_edges, shared)
+                # pair-granularity scores are computed INSIDE the checkpointed
+                # pair function (else the chunked scorer graphs of all 9 pairs
+                # coexist until backward — ~21GB OOM on ele-fashion, D2.7
+                # pitfall); shared granularities pass their precomputed scores
+                s = (None if self.composition_kind == "pair"
+                     else self._comp_scores_for_pair(f_block, edge_index, pa, pb,
+                                                     num_edges, shared))
                 m0 = self._pair_message_ckpt(f_block, edge_index, num_nodes,
                                              num_edges, pa, pb, payloads[a],
                                              s, causal)

@@ -411,6 +411,225 @@ def _write_causal_report(rows: list[dict]) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# D2.6-D parent adaptation
+# ---------------------------------------------------------------------------
+
+
+def _collect_parent_adapt() -> list[dict]:
+    rows = []
+    if not PARENT_ADAPT_ROOT.exists():
+        return rows
+    for ds_dir in sorted(PARENT_ADAPT_ROOT.iterdir()):
+        if not ds_dir.is_dir():
+            continue
+        for v_dir in sorted(ds_dir.iterdir()):
+            if not v_dir.is_dir():
+                continue
+            for sch_dir in sorted(v_dir.iterdir()):
+                if not sch_dir.is_dir():
+                    continue
+                for s_dir in sorted(sch_dir.iterdir()):
+                    sp = s_dir / "summary.json"
+                    if sp.exists():
+                        d = json.loads(sp.read_text())
+                        rows.append({
+                            "dataset": ds_dir.name, "variant": d["variant"],
+                            "schedule": d["schedule"], "seed": d["seed"],
+                            "val_acc": d["best_val_acc"],
+                            "val_macro_f1": d["best_val_macro_f1"],
+                            "best_epoch": d.get("best_epoch"),
+                            "stop_epoch": d.get("stop_epoch"),
+                            "parent_unfrozen": d.get("parent_unfrozen"),
+                            "parent_drift": d.get("parent_drift"),
+                        })
+    return rows
+
+
+def _write_parent_adapt_report(rows: list[dict]) -> Path:
+    if not rows:
+        raise RuntimeError("no parent_adapt summaries — run perf_r2d26_parent_adapt.py")
+    PARENT_ADAPT_ROOT.mkdir(parents=True, exist_ok=True)
+    with (PARENT_ADAPT_ROOT / "parent_adapt_results.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["dataset", "variant", "schedule", "seed",
+                                               "val_acc", "val_macro_f1", "best_epoch",
+                                               "stop_epoch", "parent_unfrozen"],
+                                extrasaction="ignore")
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+    drift_rows = []
+    for r in rows:
+        d = r.get("parent_drift") or {}
+        drift_rows.append({
+            "dataset": r["dataset"], "variant": r["variant"], "schedule": r["schedule"],
+            "seed": r["seed"],
+            "parent_z_cka": d.get("parent_z_cka"),
+            "parent_z_cosine": d.get("parent_z_cosine"),
+            "parent_z_rel_l2": d.get("parent_z_rel_l2"),
+        })
+    with (PARENT_ADAPT_ROOT / "parent_drift.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(drift_rows[0].keys()))
+        writer.writeheader()
+        for r in drift_rows:
+            writer.writerow(r)
+
+    # S0 = the D2.6-B integration run of the same variant (reused)
+    base_rows = _collect(INTEGRATION_ROOT)
+    report = PARENT_ADAPT_ROOT / "R2D26_PARENT_ADAPT_REPORT.md"
+    lines = ["# R2-D2.6-D — Controlled parent adaptation", "",
+             "S0 = the D2.6-B frozen run (reused); S1 = fusion only unfrozen at",
+             "ep 31 (lr 1e-4); S2 = graph transform/readout blocks unfrozen",
+             "(P0 factorizer frozen). M/T/G x 3 seeds. Parent eval-mode",
+             "throughout (no parent dropout).", ""]
+    variants = sorted({r["variant"] for r in rows})
+    for v in variants:
+        lines.append(f"## {v}")
+        lines.append("")
+        lines.append("| schedule | Movies | Toys | Grocery | M/T/G mean | ≥2/3 pos | drift CKA |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for sch in ("S1", "S2"):
+            ds_means, ckas = [], []
+            for ds in TARGET_DATASETS:
+                deltas = []
+                for s in SEEDS:
+                    cand = [r for r in rows if r["variant"] == v and r["schedule"] == sch
+                            and r["dataset"] == ds and r["seed"] == s]
+                    base = [r for r in base_rows if r["variant"] == v
+                            and r["dataset"] == ds and r["seed"] == s]
+                    if cand and base:
+                        deltas.append(100.0 * (cand[0]["val_acc"] - base[0]["val_acc"]))
+                if deltas:
+                    ds_means.append(statistics.fmean(deltas))
+                dr = [r["parent_drift"].get("parent_z_cka") for r in rows
+                      if r["variant"] == v and r["schedule"] == sch
+                      and r["dataset"] == ds and r.get("parent_drift")]
+                if dr:
+                    ckas.extend(dr)
+            mean = statistics.fmean(ds_means) if ds_means else float("nan")
+            n_pos = sum(1 for d in ds_means if d > 0) if ds_means else 0
+            cka = statistics.fmean(ckas) if ckas else float("nan")
+            lines.append(f"| {sch} | {ds_means[0] if len(ds_means) > 0 else float('nan'):+.2f} "
+                         f"| {ds_means[1] if len(ds_means) > 1 else float('nan'):+.2f} "
+                         f"| {ds_means[2] if len(ds_means) > 2 else float('nan'):+.2f} "
+                         f"| {mean:+.2f} | {n_pos}/3 | {cka:.4f} |")
+        lines.append("")
+        lines.append("S3 (P0 lr 1e-5 after ep 60) is only allowed if S2 > S0 by")
+        lines.append(">= +0.20pp AND ownership stays healthy — never automatic.")
+        lines.append("")
+    report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return report
+
+
+# ---------------------------------------------------------------------------
+# D2.6-E deep supervision
+# ---------------------------------------------------------------------------
+
+
+def _write_deep_sup_report() -> Path:
+    lam0_rows = _collect(DEEP_SUP_ROOT)
+    if not lam0_rows:
+        raise RuntimeError("no deep_supervision summaries — run perf_r2d26_deepsup.py")
+    lam01_rows = [r for r in _collect(INTEGRATION_ROOT)
+                  if r["variant"] in {r2["variant"] for r2 in lam0_rows}]
+    DEEP_SUP_ROOT.mkdir(parents=True, exist_ok=True)
+    all_rows = lam0_rows + [dict(r, deep_sup_lambda=0.1) for r in lam01_rows]
+    for r in lam0_rows:
+        r["deep_sup_lambda"] = 0.0
+    with (DEEP_SUP_ROOT / "deep_supervision_results.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["dataset", "variant", "seed",
+                                               "deep_sup_lambda", "val_acc",
+                                               "val_macro_f1", "best_epoch", "stop_epoch"],
+                                extrasaction="ignore")
+        writer.writeheader()
+        for r in all_rows:
+            writer.writerow(r)
+    report = DEEP_SUP_ROOT / "R2D26_DEEP_SUP_REPORT.md"
+    lines = ["# R2-D2.6-E — Deep-supervision confirmation", "",
+             "lambda_aux = 0 vs 0.1 for the final top-1 candidate, all other",
+             "init/schedule identical. Retain deep supervision only if the",
+             "macro gain is >= +0.20pp on Acc or F1 with no safety harm.", ""]
+    variants = sorted({r["variant"] for r in lam0_rows})
+    for v in variants:
+        lam0 = _by_key(lam0_rows, v)
+        lam1 = _by_key(lam01_rows, v)
+        for metric in ("val_acc", "val_macro_f1"):
+            deltas = []
+            for ds in TARGET_DATASETS:
+                ds_d = []
+                for s in SEEDS:
+                    if (ds, s) in lam0 and (ds, s) in lam1:
+                        ds_d.append(100.0 * (lam1[(ds, s)][metric] - lam0[(ds, s)][metric]))
+                if ds_d:
+                    deltas.append((ds, statistics.fmean(ds_d)))
+            mean = statistics.fmean([m for _, m in deltas]) if deltas else None
+            lines.append(
+                f"- {v} {metric}: lambda 0.1 - 0 = "
+                f"{mean if mean is None else f'{mean:+.3f}'}pp "
+                f"({', '.join(f'{ds} {m:+.2f}' for ds, m in deltas)})")
+        lines.append("")
+    report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return report
+
+
+# ---------------------------------------------------------------------------
+# D2.6-G final synthesis
+# ---------------------------------------------------------------------------
+
+
+def _write_final_synthesis() -> tuple[Path, Path, Path]:
+    SUMMARY_ROOT.mkdir(parents=True, exist_ok=True)
+    master = SUMMARY_ROOT / "R2D26_MASTER_TABLE.csv"
+    ledger = SUMMARY_ROOT / "R2D26_HYPOTHESIS_LEDGER.csv"
+    diagnosis = SUMMARY_ROOT / "R2D26_FINAL_DIAGNOSIS.md"
+
+    master_rows = []
+    for stage, root in (("no_compression", NC_ROOT), ("integration", INTEGRATION_ROOT),
+                        ("parent_adapt", PARENT_ADAPT_ROOT),
+                        ("deep_supervision", DEEP_SUP_ROOT)):
+        for r in _collect(root):
+            master_rows.append({"stage": stage, **r})
+    if master_rows:
+        fields = ["stage"] + sorted({k for r in master_rows for k in r if k != "stage"})
+        with master.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            for r in master_rows:
+                writer.writerow(r)
+
+    ledger_rows = [
+        {"hypothesis": "A0 strong-parent preservation removes the architecture replacement tax",
+         "stage": "D2.6-A/B", "verdict": "PENDING", "evidence": "outputs/perf_r2d26/"},
+        {"hypothesis": "no-compression HOP beats architecture-identical H1 control",
+         "stage": "D2.6-A", "verdict": "PENDING", "evidence": "outputs/perf_r2d26/no_compression/"},
+        {"hypothesis": "structured hop content survives on the A0 parent",
+         "stage": "D2.6-A/B", "verdict": "PENDING", "evidence": "outputs/perf_r2d26/"},
+        {"hypothesis": "residual/hierarchical readout recovers the D2.5-lost utility",
+         "stage": "D2.6-B", "verdict": "PENDING", "evidence": "outputs/perf_r2d26/integration/"},
+        {"hypothesis": "generic readout depth alone explains the gains",
+         "stage": "D2.6-B", "verdict": "PENDING", "evidence": "outputs/perf_r2d26/integration/"},
+        {"hypothesis": "specific H2 content (not branch presence) drives usage",
+         "stage": "D2.6-C", "verdict": "PENDING", "evidence": "outputs/perf_r2d26/causal_usage/"},
+        {"hypothesis": "parent unfreeze improves without destroying the semantic anchor",
+         "stage": "D2.6-D", "verdict": "PENDING", "evidence": "outputs/perf_r2d26/parent_adapt/"},
+        {"hypothesis": "deep supervision stays beneficial at the final candidate",
+         "stage": "D2.6-E", "verdict": "PENDING", "evidence": "outputs/perf_r2d26/deep_supervision/"},
+        {"hypothesis": "pre-aggregation neighbor utility learning is the next formal route",
+         "stage": "D2.6-G", "verdict": "OPEN", "evidence": "route matrix R3"},
+    ]
+    with ledger.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["hypothesis", "stage", "verdict", "evidence"])
+        writer.writeheader()
+        for r in ledger_rows:
+            writer.writerow(r)
+
+    if not diagnosis.exists() or "skeleton" in diagnosis.read_text():
+        diagnosis.write_text(
+            "# R2-Design-2.6 — FINAL DIAGNOSIS (skeleton)\n\n"
+            "The 16-question synthesis is authored at D2.6-G.\n", encoding="utf-8")
+    return master, ledger, diagnosis
+
+
+# ---------------------------------------------------------------------------
 # Audit
 # ---------------------------------------------------------------------------
 
@@ -532,9 +751,16 @@ def main() -> None:
             raise RuntimeError("no causal summaries — run perf_r2d26_causal.py")
         print(f"[causal] wrote {_write_causal_report(rows)}")
         return
-    raise NotImplementedError(
-        f"stage={args.stage} implemented with its prompt "
-        "(parent_adapt / deep_supervision / final)")
+    if args.stage == "parent_adapt":
+        print(f"[parent_adapt] wrote {_write_parent_adapt_report(_collect_parent_adapt())}")
+        return
+    if args.stage == "deep_supervision":
+        print(f"[deep_supervision] wrote {_write_deep_sup_report()}")
+        return
+    if args.stage == "final":
+        m, l, d = _write_final_synthesis()
+        print(f"[final] wrote {m} / {l} / {d}")
+        return
 
 
 if __name__ == "__main__":

@@ -371,6 +371,25 @@ def main() -> None:
         lines.append(f"- **{row['cell']}** — mean_acc {row['mean_acc']:.2f}, "
                      f"ΔStrongest {row['mean_delta_vs_strongest']:+.2f}, "
                      f"wins {row['num_dataset_wins']}, worst_Δ {row['worst_dataset_delta']:+.2f}")
+    # matched controls summary (only cells that actually ran)
+    lines += ["", "## Matched controls (MEAN_DUP, plan §7.5)", ""]
+    mc_lines = []
+    for mc in G2_MATCHED_CONTROLS:
+        base = mc.split("+")[0]
+        if base not in ("R1S1W1F0", "R0S1W1F0"):
+            continue
+        deltas = []
+        for dataset in DATASETS:
+            a = _cell_mean(mc, dataset, rows)
+            b = _cell_mean(base, dataset, rows)
+            if a is not None and b is not None:
+                deltas.append(a - b)
+        if deltas:
+            mc_lines.append(
+                f"- **{mc}**: 5-dataset mean Δ vs base = {statistics.mean(deltas):+.2f} pp "
+                f"(per-dataset: {', '.join(f'{d:+.2f}' for d in deltas)})"
+            )
+    lines += mc_lines or ["- (no matched-control runs found)"]
     if failures:
         lines += ["", "## Failures", ""]
         for r in failures:

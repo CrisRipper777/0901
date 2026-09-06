@@ -198,50 +198,53 @@ def main() -> None:
                          f"{statistics.mean(f1s):.4f}" if f1s else ""]
             writer.writerow(row_vals)
 
-    # --- main effects ---
+    # --- main effects (Accuracy and Macro-F1) ---
     with (G2_ROOT / "main_effects.csv").open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["factor", *DATASETS, "mean_5ds"])
-        for factor in FACTORS:
-            line = [f"delta_{factor}"]
-            for dataset in DATASETS:
-                hi = statistics.mean(
-                    _cell_mean(c, dataset, rows) for c in G2_CELLS
-                    if _cell_level(c, factor) == 1)
-                lo = statistics.mean(
-                    _cell_mean(c, dataset, rows) for c in G2_CELLS
-                    if _cell_level(c, factor) == 0)
-                line.append(f"{hi - lo:+.4f}")
-            vals = [float(v) for v in line[1:]]
-            line.append(f"{statistics.mean(vals):+.4f}")
-            writer.writerow(line)
+        writer.writerow(["factor", "metric", *DATASETS, "mean_5ds"])
+        for key, label in (("val_acc", "acc"), ("val_f1", "f1")):
+            for factor in FACTORS:
+                line = [f"delta_{factor}", label]
+                for dataset in DATASETS:
+                    hi = statistics.mean(
+                        _cell_mean(c, dataset, rows, key) for c in G2_CELLS
+                        if _cell_level(c, factor) == 1)
+                    lo = statistics.mean(
+                        _cell_mean(c, dataset, rows, key) for c in G2_CELLS
+                        if _cell_level(c, factor) == 0)
+                    line.append(f"{hi - lo:+.4f}")
+                vals = [float(v) for v in line[2:]]
+                line.append(f"{statistics.mean(vals):+.4f}")
+                writer.writerow(line)
 
-    # --- two-way interactions ---
+    # --- two-way interactions (Accuracy and Macro-F1) ---
     with (G2_ROOT / "two_way_interactions.csv").open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["interaction", *DATASETS, "mean_5ds"])
+        writer.writerow(["interaction", "metric", *DATASETS, "mean_5ds"])
         for f1_, f2_ in combinations(FACTORS, 2):
-            line = [f"I_{f1_}{f2_}"]
-            for dataset in DATASETS:
-                v = _interaction_contrast([f1_, f2_], dataset, G2_CELLS, rows, "val_acc")
-                line.append(f"{v:+.4f}" if v is not None else "")
-            vals = [float(v) for v in line[1:] if v]
-            line.append(f"{statistics.mean(vals):+.4f}" if vals else "")
-            writer.writerow(line)
+            for key, label in (("val_acc", "acc"), ("val_f1", "f1")):
+                line = [f"I_{f1_}{f2_}", label]
+                for dataset in DATASETS:
+                    v = _interaction_contrast([f1_, f2_], dataset, G2_CELLS, rows, key)
+                    line.append(f"{v:+.4f}" if v is not None else "")
+                vals = [float(v) for v in line[2:] if v]
+                line.append(f"{statistics.mean(vals):+.4f}" if vals else "")
+                writer.writerow(line)
 
-    # --- higher-order interactions ---
+    # --- higher-order interactions (Accuracy and Macro-F1) ---
     with (G2_ROOT / "higher_order_interactions.csv").open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["interaction", *DATASETS, "mean_5ds"])
+        writer.writerow(["interaction", "metric", *DATASETS, "mean_5ds"])
         for combo in (["R", "S", "W"], ["R", "S", "F"], ["R", "W", "F"],
                       ["S", "W", "F"], ["R", "S", "W", "F"]):
-            line = ["I_" + "".join(combo)]
-            for dataset in DATASETS:
-                v = _interaction_contrast(combo, dataset, G2_CELLS, rows, "val_acc")
-                line.append(f"{v:+.4f}" if v is not None else "")
-            vals = [float(v) for v in line[1:] if v]
-            line.append(f"{statistics.mean(vals):+.4f}" if vals else "")
-            writer.writerow(line)
+            for key, label in (("val_acc", "acc"), ("val_f1", "f1")):
+                line = ["I_" + "".join(combo), label]
+                for dataset in DATASETS:
+                    v = _interaction_contrast(combo, dataset, G2_CELLS, rows, key)
+                    line.append(f"{v:+.4f}" if v is not None else "")
+                vals = [float(v) for v in line[2:] if v]
+                line.append(f"{statistics.mean(vals):+.4f}" if vals else "")
+                writer.writerow(line)
 
     # --- global ranking vs A0 / strongest external ---
     ranking_rows = []

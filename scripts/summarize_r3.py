@@ -86,20 +86,22 @@ def _aux_line_at_epoch(train_log: Path, epoch: int) -> dict[str, float] | None:
     except Exception:  # noqa: BLE001
         return None
     for idx, line in enumerate(lines):
-        m = re.match(r"Epoch (\d+) \| Train Loss", line)
+        m = re.search(r"Epoch (\d+) \| Train Loss", line)
         if not m or int(m.group(1)) != epoch:
             continue
         for nxt in lines[idx + 1 : idx + 3]:
-            if nxt.startswith("Aux "):
-                stats: dict[str, float] = {}
-                for token in nxt[4:].split(" | "):
-                    parts = token.split(" ")
-                    if len(parts) >= 2:
-                        try:
-                            stats[parts[0]] = float(parts[1])
-                        except ValueError:
-                            continue
-                return stats
+            aux_pos = nxt.find("Aux ")
+            if aux_pos < 0:
+                continue
+            stats: dict[str, float] = {}
+            for token in nxt[aux_pos + 4 :].split(" | "):
+                parts = token.split(" ")
+                if len(parts) >= 2:
+                    try:
+                        stats[parts[0]] = float(parts[1])
+                    except ValueError:
+                        continue
+            return stats
     return None
 
 
@@ -203,6 +205,11 @@ def _collect_runs() -> tuple[dict[tuple[str, str, int], dict], list[str]]:
                     }
                     for k in MECH_KEYS:
                         if run.get(k) is None:
+                            # basis stats are legitimately absent for the
+                            # non-basis variants (V0 diagonal / V1 static /
+                            # V6 film)
+                            if k == "basis_entropy" and variant in ("V0", "V1", "V6"):
+                                continue
                             anomalies.append(f"NaN/missing aux stat {k}: {variant} {dataset} seed={seed}")
                 else:
                     anomalies.append(f"no Aux line for best epoch: {variant} {dataset} seed={seed}")
@@ -236,10 +243,18 @@ def _g0_anchors() -> dict[str, dict[str, dict[str, float | None]]]:
                     tests.append(t)
             if vals:
                 anchors[dataset][model_dir.name] = {
-                    "val": _mean(vals), "val_std": _std(vals),
-                    "test": _mean(tests) if tests else None,
-                    "test_std": _std(tests) if tests else None,
+                    "val_acc": _mean(vals), "val_acc_std": _std(vals),
+                    "test_acc": _mean(tests) if tests else None,
+                    "test_macro_f1": None,  # filled below
+                    "test_acc_std": _std(tests) if tests else None,
                 }
+            f1s = []
+            for seed in SEEDS:
+                res = _read_json(model_dir / f"seed_{seed}" / "hydra" / "results.json")
+                if res and isinstance(res.get("test_macro_f1"), dict):
+                    f1s.append(float(res["test_macro_f1"]["mean"]))
+            if f1s and model_dir.name in anchors[dataset]:
+                anchors[dataset][model_dir.name]["test_macro_f1"] = _mean(f1s)
     return anchors
 
 
@@ -290,15 +305,22 @@ def _write_report(runs: dict, anomalies: list[str]) -> None:
 
     def _anchor(dataset: str, model: str, metric: str) -> float | None:
         entry = anchors.get(dataset, {}).get(model)
-        return entry.get(metric) if entry else None
+        if not entry:
+            return None
+        key = "test_macro_f1" if metric == "test_f1" else metric
+        value = entry.get(key)
+        # G0 results.json stores fractions; report uses percentage points
+        return value * 100 if value is not None else None
 
     def _strongest(dataset: str, metric: str) -> tuple[str, float]:
+        key = "test_macro_f1" if metric == "test_f1" else metric
         best = max(
-            ((m, a[metric]) for m, a in anchors.get(dataset, {}).items() if a.get(metric) is not None),
+            ((m, a[key]) for m, a in anchors.get(dataset, {}).items() if a.get(key) is not None),
             key=lambda kv: kv[1],
             default=("?", None),
         )
-        return best
+        value = best[1] * 100 if best[1] is not None else None
+        return best[0], value
 
     lines: list[str] = []
     add = lines.append

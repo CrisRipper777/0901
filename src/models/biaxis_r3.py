@@ -53,6 +53,7 @@ class Model(P0Model):
         self.log_transition_stats = bool(t.get("log_transition_stats", True))
         self.log_basis_stats = bool(t.get("log_basis_stats", True))
         self.log_grad_stats = bool(t.get("log_grad_stats", False))
+        self.memory_checkpoint = bool(t.get("memory_checkpoint", True))
         if bool(t.get("use_exposure", False)):
             raise NotImplementedError(
                 "R3-v1 does not implement the exposure gate (plan §12); "
@@ -81,6 +82,7 @@ class Model(P0Model):
                     dropout=float(cfg.model.dropout),
                     activation=str(cfg.model.get("activation", "gelu")),
                     norm=str(cfg.model.get("norm", "layernorm")),
+                    memory_checkpoint=self.memory_checkpoint,
                 )
                 for _ in range(self.num_transition_layers)
             ]

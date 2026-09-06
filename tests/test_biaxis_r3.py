@@ -312,6 +312,34 @@ def test_offdiag_init_ratio_small_positive() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Memory checkpoint parity (the ele-fashion OOM fix)
+# ---------------------------------------------------------------------------
+
+
+def test_memory_checkpoint_parity() -> None:
+    """The checkpointed training path must reproduce the plain path: same
+    forward output and matching gradients (the message segments are
+    randomness-free, so recomputation is deterministic)."""
+    torch.manual_seed(123)
+    layer_ckpt = _layer(memory_checkpoint=True)
+    torch.manual_seed(123)
+    layer_plain = _layer(memory_checkpoint=False)
+    H = torch.randn(N, 3, D)
+    _, edge_index = _graph(11)
+    layer_ckpt.train()
+    layer_plain.train()
+    out_c, _ = layer_ckpt(H, edge_index, N)
+    out_p, _ = layer_plain(H, edge_index, N)
+    assert torch.equal(out_c, out_p)
+    out_c.sum().backward()
+    out_p.sum().backward()
+    for (kc, pc), (kp, pp) in zip(layer_ckpt.named_parameters(), layer_plain.named_parameters()):
+        assert kc == kp
+        assert pc.grad is not None and pp.grad is not None, f"missing grad at {kc}"
+        assert torch.allclose(pc.grad, pp.grad, atol=1e-6, rtol=1e-6), f"grad mismatch at {kc}"
+
+
+# ---------------------------------------------------------------------------
 # T7: forward / inference parity (plan §16.5)
 # ---------------------------------------------------------------------------
 

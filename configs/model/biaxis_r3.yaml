@@ -70,6 +70,13 @@ transition:
   # --- optional (plan §12: NOT implemented in R3-v1, must stay false) ---
   use_exposure: false
 
+  # --- memory (plan §17; the p3/CORT ele-fashion fix) ---
+  # per-chunk message segments run under activation checkpointing: the
+  # [E, d]-level router/basis intermediates are recomputed in backward
+  # instead of retained. The segments are randomness-free (no dropout
+  # inside router/context/basis) -> recomputation is bitwise identical.
+  memory_checkpoint: true
+
   # --- logging / debug (plan §18) ---
   log_transition_stats: true
   log_basis_stats: true

@@ -24,19 +24,39 @@ Ownership-Structured Semantic Transition Layer (plan §3/§4/§5/§6/§7):
                                                           plan §7/§16.7)
 
 Memory discipline (plan §17): every edge-level tensor is computed inside
-chunks and released immediately; only [N, d]-level channel accumulators are
-retained. The [E, d_r, d_r] matrix is never materialized. Basis transforms
-are low-rank: z_r = A_r(C_r(v)), mixed by the softmax router over functional
-bases (NOT over neighbors, plan §4.3).
+chunks; the per-chunk message segments run under activation checkpointing
+(memory_checkpoint=true, the p3/CORT ele-fashion fix): their [E, d]-level
+intermediates are recomputed in backward instead of retained. The segment
+is randomness-free (no dropout inside the router / context / basis — see
+below), so the recomputation is bitwise identical (no dropout consumed in
+the segment). The [E, d_r, d_r] matrix is never materialized; basis
+transforms are low-rank z_r = A_r(act(C_r(v))), mixed by the softmax router
+over functional bases (NOT over neighbors, plan §4.3).
 """
 
 from __future__ import annotations
 
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from .common import get_activation, make_norm
+
+# torch 2.4's non-reentrant checkpoint internally calls the deprecated
+# torch.cpu.amp.autocast(...) constructor on every invocation; the kwargs are
+# empty unless CPU autocast is enabled (we never enable it), so the
+# FutureWarning is purely cosmetic. Silencing it here, scoped to
+# torch.utils.checkpoint, keeps training logs clean (same pattern as
+# biaxis_p3.py).
+warnings.filterwarnings(
+    "ignore",
+    message=".*torch.cpu.amp.autocast.*deprecated.*",
+    category=FutureWarning,
+    module=r"torch\.utils\.checkpoint",
+)
 
 FACTOR_NAMES = ("c", "pt", "pv")
 NUM_FACTORS = 3
@@ -67,6 +87,7 @@ class OwnershipTransitionLayer(nn.Module):
         dropout: float,
         activation: str,
         norm: str,
+        memory_checkpoint: bool = True,
     ) -> None:
         super().__init__()
         d = int(factor_dim)
@@ -81,6 +102,7 @@ class OwnershipTransitionLayer(nn.Module):
         self.preserve_source_channels = bool(preserve_source_channels)
         self.offdiag_enabled = self.cross_factor and self.transition_mode != "diagonal"
         self.edge_chunk_size = max(int(edge_chunk_size), 1)
+        self.memory_checkpoint = bool(memory_checkpoint)
         self.d_r = int(relation_dim) if self.use_dual_space else d
         self.activation = get_activation(activation)
 
@@ -99,13 +121,14 @@ class OwnershipTransitionLayer(nn.Module):
             self.offdiag_scale = nn.Parameter(torch.tensor(float(offdiag_init_scale)))
 
         # ---- same-node context (conditioning ONLY, plan §3.1) -------------
+        # NOTE: no dropout here — the context feeds the checkpointed message
+        # segment, which must be randomness-free (see module docstring).
         self.context_dim = int(context_dim) if self.use_same_node_context else 0
         if self.use_same_node_context:
             self.context_mlp = nn.Sequential(
                 nn.Linear(NUM_FACTORS * d, self.context_dim),
                 make_norm(norm, self.context_dim),
                 get_activation(activation),
-                nn.Dropout(float(dropout)),
                 nn.Linear(self.context_dim, self.context_dim),
             )
 
@@ -137,7 +160,7 @@ class OwnershipTransitionLayer(nn.Module):
                 self._pair_idx = {pair: idx for idx, pair in enumerate(OFFDIAG_PAIRS)}
             elif self.transition_mode == "film":
                 # feature-wise affine modulation conditioned on the descriptor
-                self.router = self._build_router(2 * self.d_r, router_hidden_dim, dropout, activation, norm)
+                self.router = self._build_router(2 * self.d_r, router_hidden_dim, activation, norm)
             elif self.transition_mode == "basis":
                 # shared low-rank functional bases (plan §4.3):
                 # B_r(x) = A_r(act(C_r(x))), shared across ALL off-diagonal
@@ -150,7 +173,7 @@ class OwnershipTransitionLayer(nn.Module):
                 self.basis_up = nn.ModuleList(
                     [nn.Linear(int(basis_rank), self.d_r) for _ in range(self.num_bases)]
                 )
-                self.router = self._build_router(self.num_bases, router_hidden_dim, dropout, activation, norm)
+                self.router = self._build_router(self.num_bases, router_hidden_dim, activation, norm)
 
         # ---- target update (plan §6/§7): pre-LN, no post-LN ---------------
         if self.offdiag_enabled and self.preserve_source_channels:
@@ -164,40 +187,85 @@ class OwnershipTransitionLayer(nn.Module):
         self,
         out_dim: int,
         router_hidden_dim: int,
-        dropout: float,
         activation: str,
         norm: str,
     ) -> nn.Module:
+        # NOTE: no dropout — the router runs inside the checkpointed message
+        # segment, which must be deterministic for numerics-preserving
+        # recomputation (same reasoning as the p3 memory fix).
         in_dim = 2 * self.d_r + self.context_dim + 2 * self.factor_id_dim
         return nn.Sequential(
             nn.Linear(in_dim, int(router_hidden_dim)),
             make_norm(norm, int(router_hidden_dim)),
             get_activation(activation),
-            nn.Dropout(float(dropout)),
             nn.Linear(int(router_hidden_dim), out_dim),
         )
 
     # ------------------------------------------------------------------
-    # Descriptor / message helpers
+    # Per-chunk message segments (checkpointable, randomness-free)
     # ------------------------------------------------------------------
 
-    def _descriptor(
+    def _diag_chunk(
         self,
-        q_b_dst: torch.Tensor,  # [c, d_r]
-        v_a_src: torch.Tensor,  # [c, d_r]
-        s_dst: torch.Tensor | None,  # [c, d_ctx] (optional)
+        b: int,
+        v0: torch.Tensor,
+        v1: torch.Tensor,
+        v2: torch.Tensor,
+        s_c: torch.Tensor,
+    ) -> torch.Tensor:
+        v_s = (v0, v1, v2)[b][s_c]
+        return self.diag[b](v_s)
+
+    def _offdiag_chunk(
+        self,
         a: int,
         b: int,
-        e_embs: torch.Tensor,  # [3, t]
-    ) -> torch.Tensor:
-        """r_ji^{ab} = phi_r input (plan §3.4): [q_i^b | v_j^a | S_i | e_a | e_b]."""
-        c = int(q_b_dst.size(0))
-        parts = [q_b_dst, v_a_src]
-        if s_dst is not None:
-            parts.append(s_dst)
-        parts.append(e_embs[a].unsqueeze(0).expand(c, -1))
-        parts.append(e_embs[b].unsqueeze(0).expand(c, -1))
-        return torch.cat(parts, dim=-1)
+        v0: torch.Tensor,
+        v1: torch.Tensor,
+        v2: torch.Tensor,
+        q0: torch.Tensor,
+        q1: torch.Tensor,
+        q2: torch.Tensor,
+        S: torch.Tensor | None,
+        e_embs: torch.Tensor,
+        s_c: torch.Tensor,
+        d_c: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """One (a,b) off-diagonal message segment for one edge chunk.
+
+        Returns (m [c, d] — decoded AND offdiag-scaled, omega [c, R]
+        detached for router statistics, or None for non-basis modes).
+        """
+        v_s = (v0, v1, v2)[a][s_c]
+        if self.transition_mode == "static":
+            m_rel = self.cross_static[self._pair_idx[(a, b)]](v_s)
+            omega = None
+        else:
+            q_d = (q0, q1, q2)[b][d_c]
+            parts = [q_d, v_s]
+            if S is not None:
+                parts.append(S[d_c])
+            c = int(q_d.size(0))
+            parts.append(e_embs[a].unsqueeze(0).expand(c, -1))
+            parts.append(e_embs[b].unsqueeze(0).expand(c, -1))
+            desc = torch.cat(parts, dim=-1)
+            if self.transition_mode == "film":
+                gamma, beta = self.router(desc).chunk(2, dim=-1)
+                m_rel = gamma * v_s + beta
+                omega = None
+            else:  # basis
+                omega = F.softmax(self.router(desc), dim=-1)  # [c, R]
+                zs = torch.stack(
+                    [
+                        self.basis_up[r](self.activation(self.basis_down[r](v_s)))
+                        for r in range(self.num_bases)
+                    ],
+                    dim=1,
+                )  # [c, R, d_r]
+                m_rel = torch.einsum("cr,crd->cd", omega, zs)
+                omega = omega.detach()
+        m = self.target_decode[b](m_rel)
+        return self.offdiag_scale * m, omega
 
     # ------------------------------------------------------------------
     # Layer forward
@@ -255,6 +323,8 @@ class OwnershipTransitionLayer(nn.Module):
         omega_count = 0
         e_embs = self.factor_emb.weight
 
+        use_ckpt = self.memory_checkpoint and torch.is_grad_enabled() and self.training
+
         # ---- pre-aggregation functional messages, edge-chunked (plan §17)
         for start in range(0, num_edges, self.edge_chunk_size):
             end = min(start + self.edge_chunk_size, num_edges)
@@ -262,7 +332,12 @@ class OwnershipTransitionLayer(nn.Module):
 
             # diagonal: ownership-preserving propagation (plan §3.3)
             for b in range(NUM_FACTORS):
-                m = self.diag[b](v[b][s_c])  # [c, d]
+                if use_ckpt:
+                    m = torch.utils.checkpoint.checkpoint(
+                        self._diag_chunk, b, v[0], v[1], v[2], s_c, use_reentrant=False
+                    )
+                else:
+                    m = self._diag_chunk(b, v[0], v[1], v[2], s_c)
                 acc[(b, b)] = acc[(b, b)].index_add(0, d_c, m)
 
             if not self.offdiag_enabled or self.offdiag_scale is None:
@@ -270,50 +345,39 @@ class OwnershipTransitionLayer(nn.Module):
                 # path contributes EXACTLY nothing and is skipped entirely
                 continue
 
-            eps = self.offdiag_scale
             for a in range(NUM_FACTORS):
-                v_s = v[a][s_c]
-                if self.transition_mode == "basis":
-                    # shared low-rank bases evaluated once per source factor
-                    # (plan §4.3); never a [c, d_r, d_r] matrix
-                    zs = torch.stack(
-                        [
-                            self.basis_up[r](self.activation(self.basis_down[r](v_s)))
-                            for r in range(self.num_bases)
-                        ],
-                        dim=1,
-                    )  # [c, R, d_r]
                 for b in range(NUM_FACTORS):
                     if a == b:
                         continue
-                    if self.transition_mode == "static":
-                        m_rel = self.cross_static[self._pair_idx[(a, b)]](v_s)
+                    if use_ckpt:
+                        m, omega = torch.utils.checkpoint.checkpoint(
+                            self._offdiag_chunk,
+                            a, b, v[0], v[1], v[2], q[0], q[1], q[2],
+                            S, e_embs, s_c, d_c,
+                            use_reentrant=False,
+                        )
                     else:
-                        desc = self._descriptor(q[b][d_c], v_s, S[d_c] if S is not None else None, a, b, e_embs)
-                        if self.transition_mode == "film":
-                            gamma, beta = self.router(desc).chunk(2, dim=-1)
-                            m_rel = gamma * v_s + beta
-                        else:  # basis
-                            omega = F.softmax(self.router(desc), dim=-1)  # [c, R]
-                            m_rel = torch.einsum("cr,crd->cd", omega, zs)
-                            # router statistics (detached scalars)
-                            w_det = omega.detach()
-                            if omega_sum is None:
-                                omega_sum = w_det.sum(dim=0)
-                                omega_top1 = torch.zeros(
-                                    self.num_bases, dtype=w_det.dtype, device=device
-                                )
-                            else:
-                                omega_sum = omega_sum + w_det.sum(dim=0)
-                            omega_top1 = omega_top1 + torch.bincount(
-                                w_det.argmax(dim=-1), minlength=self.num_bases
-                            ).to(w_det.dtype)
-                            omega_ent_sum += float(
-                                -(w_det * torch.log(w_det + R3_EPS)).sum(dim=-1).sum().item()
+                        m, omega = self._offdiag_chunk(
+                            a, b, v[0], v[1], v[2], q[0], q[1], q[2],
+                            S, e_embs, s_c, d_c,
+                        )
+                    acc[(a, b)] = acc[(a, b)].index_add(0, d_c, m)
+                    if omega is not None:
+                        # router statistics (already detached)
+                        if omega_sum is None:
+                            omega_sum = omega.sum(dim=0)
+                            omega_top1 = torch.zeros(
+                                self.num_bases, dtype=omega.dtype, device=device
                             )
-                            omega_count += int(w_det.size(0))
-                    m = self.target_decode[b](m_rel)
-                    acc[(a, b)] = acc[(a, b)].index_add(0, d_c, eps * m)
+                        else:
+                            omega_sum = omega_sum + omega.sum(dim=0)
+                        omega_top1 = omega_top1 + torch.bincount(
+                            omega.argmax(dim=-1), minlength=self.num_bases
+                        ).to(omega.dtype)
+                        omega_ent_sum += float(
+                            -(omega * torch.log(omega + R3_EPS)).sum(dim=-1).sum().item()
+                        )
+                        omega_count += int(omega.size(0))
 
         # ---- mean neighbor aggregation (plan §5) --------------------------
         for key in acc:

@@ -20,10 +20,13 @@ from __future__ import annotations
 import csv
 import json
 import statistics
+import sys
 from itertools import combinations
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 G2_ROOT = PROJECT_ROOT / "outputs" / "r2d29" / "g2_synergy"
 G0_ROOT = PROJECT_ROOT / "outputs" / "r2d29" / "g0_reference"
 
@@ -183,19 +186,15 @@ def main() -> None:
         writer.writerow(["cell", *[f"{d}_acc" for d in DATASETS],
                          *[f"{d}_f1" for d in DATASETS], "mean_acc_5ds", "mean_f1_5ds"])
         for cell in G2_CELLS:
+            accs = [_cell_mean(cell, d, rows, "val_acc") for d in DATASETS]
+            f1s = [_cell_mean(cell, d, rows, "val_f1") for d in DATASETS]
             row_vals = [cell]
-            accs, f1s = [], []
-            for dataset in DATASETS:
-                a = _cell_mean(cell, dataset, rows, "val_acc")
-                f1 = _cell_mean(cell, dataset, rows, "val_f1")
-                accs.append(a)
-                f1s.append(f1)
-                row_vals += [f"{a:.4f}" if a is not None else "",
-                             f"{f1:.4f}" if f1 is not None else ""]
-            accs = [a for a in accs if a is not None]
-            f1s = [v for v in f1s if v is not None]
-            row_vals += [f"{statistics.mean(accs):.4f}" if accs else "",
-                         f"{statistics.mean(f1s):.4f}" if f1s else ""]
+            row_vals += [f"{a:.4f}" if a is not None else "" for a in accs]
+            row_vals += [f"{v:.4f}" if v is not None else "" for v in f1s]
+            accs_ok = [a for a in accs if a is not None]
+            f1s_ok = [v for v in f1s if v is not None]
+            row_vals += [f"{statistics.mean(accs_ok):.4f}" if accs_ok else "",
+                         f"{statistics.mean(f1s_ok):.4f}" if f1s_ok else ""]
             writer.writerow(row_vals)
 
     # --- main effects (Accuracy and Macro-F1) ---

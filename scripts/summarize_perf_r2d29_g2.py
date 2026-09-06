@@ -41,7 +41,7 @@ FACTORS = ["R", "S", "W", "F"]
 def _cell_level(cell: str, factor: str) -> int:
     """1 if the factor is at its high level in the cell name, else 0.
     Cell names are R{r}S{s}W{w}F{f} (e.g. R1S0W1F0)."""
-    return int(cell[1 + FACTORS.index(factor)])
+    return int(cell[1 + 2 * FACTORS.index(factor)])
 
 
 def _load_runs() -> list[dict]:

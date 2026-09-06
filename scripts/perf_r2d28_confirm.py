@@ -75,7 +75,8 @@ OPERATOR_EXTRA = {"O0": {}, "O1": {}, "O2": {}, "O3": {}, "O4": {},
 
 def run_worker(dataset: str, variant: str, seed: int, outdir: Path,
                epochs: int | None, force: bool, e_star: str, c_star: str,
-               m_star: str, o_star: str, norm_match: bool) -> None:
+               m_star: str, o_star: str, norm_match: bool,
+               adapt: bool = False) -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     if (outdir / "summary.json").exists() and not force:
         print(f"[{dataset} {variant} s{seed}] SKIP", flush=True)
@@ -102,13 +103,23 @@ def run_worker(dataset: str, variant: str, seed: int, outdir: Path,
     history_writer = csv.DictWriter(history_file,
                                     fieldnames=["epoch", "lr", "train_ce", "val_acc"])
     history_writer.writeheader()
-    res = train_relfunc_model(
-        data, model, head, device, total_epochs=total_epochs,
-        history_callback=history_writer.writerow)
+    if adapt:
+        from src.analysis.perf_r2d28_utils import train_relfunc_parent_adapt
+
+        res = train_relfunc_parent_adapt(
+            data, model, head, device, total_epochs=total_epochs,
+            history_callback=history_writer.writerow)
+    else:
+        res = train_relfunc_model(
+            data, model, head, device, total_epochs=total_epochs,
+            history_callback=history_writer.writerow)
     history_file.close()
 
-    torch.save({"head_state": head.state_dict(), "model_state": model.state_dict()},
-               outdir / "best.pt")
+    ckpt = {"head_state": head.state_dict(), "model_state": model.state_dict()}
+    if adapt:
+        ckpt["parent_state"] = {k: v.detach().cpu() for k, v
+                                in setup.parent.state_dict().items()}
+    torch.save(ckpt, outdir / "best.pt")
     summary = {
         "dataset": dataset, "variant": variant, "seed": seed,
         "exposure_kind": model.exposure_kind,
@@ -268,6 +279,18 @@ def summarize(e_star: str) -> None:
         f"- Candidate - A0_FORMAL (M/T/G): Acc {for_acc['mean'] if for_acc['mean'] is None else f'{for_acc['mean']:+.3f}'}pp; "
         f"F1 {for_f1['mean'] if for_f1['mean'] is None else f'{for_f1['mean']:+.3f}'}pp → "
         f"FORMAL GO: {'PASS' if for_go else 'FAIL'}",
+    ]
+    # controlled parent adaptation (v2 §13), if run
+    adapt_acc = _paired("ADAPT", "A0_MATCHED", "best_val_acc")
+    adapt_f1 = _paired("ADAPT", "A0_MATCHED", "best_val_macro_f1")
+    adapt_for = _paired("ADAPT", "A0_FORMAL", "best_val_acc")
+    if adapt_acc["mean"] is not None:
+        lines += [
+            f"- ADAPT - A0_MATCHED (M/T/G): Acc "
+            f"{adapt_acc['mean']:+.3f}pp; F1 {adapt_f1['mean']:+.3f}pp",
+            f"- ADAPT - A0_FORMAL (M/T/G): Acc {adapt_for['mean']:+.3f}pp",
+        ]
+    lines += [
         "",
         "Guard verdicts vs A0_FORMAL are computed in the final synthesis"
         " (D2.8-H).",
@@ -294,6 +317,9 @@ def main() -> None:
     parser.add_argument("--norm-match", dest="norm_match", action="store_true",
                         default=True)
     parser.add_argument("--unrestricted", dest="norm_match", action="store_false")
+    parser.add_argument("--adapt", dest="adapt", action="store_true", default=False,
+                        help="controlled parent adaptation (v2 §13)")
+    parser.add_argument("--no-adapt", dest="adapt", action="store_false")
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--dataset", default=None)
     parser.add_argument("--variant", default=None)
@@ -310,7 +336,7 @@ def main() -> None:
     if args.worker:
         run_worker(args.dataset, args.variant, args.seed, Path(args.outdir),
                    args.epochs, args.force, args.e_star, args.c_star,
-                   args.m_star, args.o_star, args.norm_match)
+                   args.m_star, args.o_star, args.norm_match, args.adapt)
         return
     if args.summarize:
         summarize(args.e_star)
@@ -319,12 +345,14 @@ def main() -> None:
     datasets = DATASETS if not args.datasets else [d for d in args.datasets.split(",")]
     seeds = [42, 43, 44] if not args.seeds else [int(s) for s in args.seeds.split(",")]
     gpus = [int(g) for g in args.gpus.split(",")]
-    jobs = [(d, "FINAL", s) for d in datasets for s in seeds]
+    variant = "ADAPT" if args.adapt else "FINAL"
+    jobs = [(d, variant, s) for d in datasets for s in seeds]
     launch_jobs(Path(__file__).resolve(), jobs, CONFIRM_ROOT, gpus, args.force,
                 args.epochs, extra_flags=[
                     "--e-star", args.e_star, "--c-star", args.c_star,
                     "--m-star", args.m_star, "--o-star", args.o_star,
-                    "--norm-match" if args.norm_match else "--unrestricted"])
+                    "--norm-match" if args.norm_match else "--unrestricted",
+                    "--adapt" if args.adapt else "--no-adapt"])
 
 
 if __name__ == "__main__":

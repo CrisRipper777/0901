@@ -267,6 +267,119 @@ def train_relfunc_model(
     }
 
 
+def train_relfunc_parent_adapt(
+    data, model: nn.Module, head: nn.Module, device: torch.device,
+    *, total_epochs: int = 300, patience: int = 30,
+    unfreeze_epoch: int = 31, parent_lr: float = 1e-4,
+    history_callback=None,
+) -> dict:
+    """v2 §13 single permitted controlled parent adaptation: epochs 1..30 the
+    parent stays fully frozen; epoch 31+ only the A0 final fusion and the
+    graph operator are released (P0 factorizer stays frozen). Parent lr 1e-4,
+    new-branch lr 1e-3, parent wd 0 (it was trained long ago; released
+    gently). Best Val Acc, warmup10+cosine for the branch."""
+    assert_no_test_access(data)
+    model = model.to(device)
+    head = head.to(device)
+    model.parent_frozen = True
+    x = data.x.to(device)
+    ei = data.edge_index.to(device)
+    train_idx = data.train_idx.to(device)
+    y_train = data.y[data.train_idx].to(device)
+    val_idx = data.val_idx.to(device)
+    y_val = data.y[data.val_idx].to(device)
+    criterion = nn.CrossEntropyLoss()
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW([
+        {"params": trainable + list(head.parameters()),
+         "lr": 1e-3, "weight_decay": 1e-4},
+        {"params": [], "lr": parent_lr, "weight_decay": 0.0},  # parent group
+    ])
+
+    def _parent_params():
+        parent = model.parent
+        out = []
+        for name in ("fusion", "operator"):
+            mod = getattr(parent, name, None)
+            if mod is not None:
+                out += list(mod.parameters())
+        return out
+
+    parent_released = False
+
+    def _apply_lr(epoch: int) -> None:
+        opt.param_groups[0]["lr"] = scheduled_lr(epoch, total_epochs, 1e-3)
+        if parent_released:
+            opt.param_groups[1]["lr"] = parent_lr
+
+    history: list[dict] = []
+    best_acc, best_epoch, best_state = -1.0, None, None
+    patience_left = patience
+    stop_epoch = total_epochs
+    for epoch in range(1, total_epochs + 1):
+        if epoch == unfreeze_epoch and not parent_released:
+            parent_released = True
+            model.parent_frozen = False
+            for p in _parent_params():
+                p.requires_grad_(True)
+            opt.param_groups[1]["params"] = _parent_params()
+        _apply_lr(epoch)
+        opt.zero_grad(set_to_none=True)
+        model.train()
+        z, _, _, _, _ = model(x, ei)
+        loss = criterion(head(z[train_idx]), y_train)
+        loss.backward()
+        clip_params = trainable + list(head.parameters()) + \
+            (opt.param_groups[1]["params"] if parent_released else [])
+        nn.utils.clip_grad_norm_(clip_params, 1.0)
+        opt.step()
+        with torch.no_grad():
+            model.eval()
+            z_eval, _, _, _, _ = model(x, ei)
+            pred_v = head(z_eval[val_idx]).argmax(-1)
+            acc = float((pred_v == y_val).float().mean().item())
+            del z_eval
+        row = {"epoch": epoch, "lr": float(opt.param_groups[0]["lr"]),
+               "train_ce": float(loss.item()), "val_acc": acc}
+        if acc > best_acc:
+            best_acc, best_epoch = acc, epoch
+            best_state = {
+                "head": {k: v.detach().clone() for k, v in head.state_dict().items()},
+                "model": {k: v.detach().clone() for k, v in model.state_dict().items()},
+            }
+            patience_left = patience
+        else:
+            patience_left -= 1
+            if patience_left <= 0:
+                stop_epoch = epoch
+                break
+        if history_callback is not None:
+            history_callback(row)
+        history.append(row)
+
+    model.load_state_dict(best_state["model"])
+    head.load_state_dict(best_state["head"])
+    model.eval()
+    head.eval()
+    with torch.no_grad():
+        z_best, _, _, _, _ = model(x, ei)
+    from src.analysis.perf_r2d15_utils import val_metrics_with_head
+
+    m_full = val_metrics_with_head(head, z_best, data, device)
+    return {
+        "best_val_acc": best_acc,
+        "best_val_macro_f1": m_full["val_macro_f1"],
+        "per_class_f1": m_full["per_class_f1"],
+        "best_epoch": best_epoch,
+        "stop_epoch": stop_epoch,
+        "history": history,
+        "z_best": z_best,
+        "trainable_params": int(sum(p.numel() for p in trainable)),
+        "unfreeze_epoch": int(unfreeze_epoch),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Job orchestration (D2.7 matrix pattern: per-GPU subprocess workers)
 # ---------------------------------------------------------------------------

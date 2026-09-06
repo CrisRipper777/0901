@@ -79,7 +79,7 @@ NC / LP head（runner 侧，模型不绑定）
 
 - **params（Movies，含 head）= 2,170,752**（对比 biaxis_final/A0 ≈ 4.66M，更小）。构成：P0 factorizer+recon ≈ 1.0M；每 transition 层 ≈ 0.53M（V/Q 6×16K + diag 3×16.5K + basis 8×2K + router 46K + D_b^cross 3×16.5K + context 57K + update 3×16.5K）；multi-scale 148K；fusion 98.6K。
 - **复杂度**：每层每条边 O(d_r² + R·d_r·rank + R·d_r)（basis 模式）；router 为每条 off-diagonal 边 O(d_r²)。相比 materialize [E, d_r, d_r] 的 O(E·d_r²) 显存，本实现只有 O(E·d_r) 瞬态显存（计划 §17 要求满足）。
-- **显存**：ele-fashion 规模（N≈400K）估计：H/通道累加器 9×[N,128]≈1.8GB + v/q 0.4GB + chunk 瞬态 ≈1.2GB（200K edges）→ 训练峰值预计 <10GB（待 R3-3 实测；Movies smoke 无压力）。edge_chunk_size 200000→100000 为首个降配杠杆（计划 §14）。
+- **显存**：ele-fashion（N=97,766, E≈200K）实测：**初版在 FULL/V5 训练 OOM（23.6GB）**——根因不是 chunk 瞬态，而是 autograd 对 6 个 off-diagonal pair 的逐边中间激活（router 输入 [E,352]、激活 [E,128]、basis zs [E,4,128]、decoder 输入）在 forward 期间全部保留。修复（与 p3/CORT 同款）：`transition.memory_checkpoint=true`（默认），diag/offdiag 消息计算段按 chunk 走 `torch.utils.checkpoint(use_reentrant=False)`，反向时重算 [E,d]-级中间量；为保证重算 bitwise 一致，router/context/basis 段内**无 dropout**（P0 factorizer/fusion 的 dropout 0.2 保留）。修复后 ele-fashion V5 smoke：rc=0、~1.5s/epoch、无 NaN；checkpoint-parity 测试（forward bitwise 相等 + grad allclose 1e-6）。edge_chunk_size 200000→100000 仍为降配杠杆（计划 §14）。
 
 ## 5. 单元测试（R3-0B，14 tests，全过）
 
@@ -111,9 +111,10 @@ loss = Σz² + aux 一次 backward：factorizer / diag / basis_down / basis_up /
 
 1. **ΔH 无激活**：按计划 §7 公式字面实现（U_b(LN(·)) 线性写回，非线性只来自 LN / router / context / final fusion）。若 R3-1 ceiling 不足，这是 R3-2 的合法候选（"operator capacity 调优"）。
 2. **静态 diagonal 未加 activation**（计划 §3.3 字面）。
-3. `log_grad_stats=true` 时 grad norm 为上一 step 的值（backward hook 时机），仅 debug 用，默认关闭。
-4. sampled training 可用（forward 无全局 buffer 依赖），但 full_graph_training=true 为默认协议（与 A0 一致）。
-5. exposure gate 未实现（计划 §12 明确暂缓）。
+3. **router/context 无 dropout**（memory-checkpoint 段必须无随机性，2026-09-06 ele-fashion OOM 修复时决定；P0 factorizer/fusion dropout 0.2 不受影响）。
+4. `log_grad_stats=true` 时 grad norm 为上一 step 的值（backward hook 时机），仅 debug 用，默认关闭。
+5. sampled training 可用（forward 无全局 buffer 依赖），但 full_graph_training=true 为默认协议（与 A0 一致）。
+6. exposure gate 未实现（计划 §12 明确暂缓）。
 
 ## 9. Git 状态
 

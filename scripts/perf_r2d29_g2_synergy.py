@@ -174,8 +174,13 @@ def main() -> None:
         datasets = [d for d in args.datasets.split(",") if d in DATASETS]
     if args.matched:
         if args.matched_cells:
-            cells = {c: G2_MATCHED_CONTROLS[c] for c in args.matched_cells.split(",")
-                     if c in G2_MATCHED_CONTROLS}
+            # accept either the base cell (R1S1W1F0) or the full
+            # matched-control name (R1S1W1F0+MEAN_DUP)
+            requested = args.matched_cells.split(",")
+            cells = {
+                mc: cfg for mc, cfg in G2_MATCHED_CONTROLS.items()
+                if mc in requested or mc.split("+")[0] in requested
+            }
         else:
             cells = dict(G2_MATCHED_CONTROLS)
     else:

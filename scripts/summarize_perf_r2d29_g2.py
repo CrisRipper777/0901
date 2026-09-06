@@ -334,13 +334,18 @@ def main() -> None:
                                  f"{statistics.mean(secs):.1f}" if secs else ""])
 
     # --- report ---
-    failures = [r for r in rows if r["status"] != "ok"]
+    # only report cells that were actually launched (>=1 run present): the
+    # other matched controls were deliberately not run in this phase
+    launched_cells = {(r["dataset"], r["cell"]) for r in rows if r["status"] == "ok"}
+    failures = [r for r in rows if r["status"] != "ok"
+                and (r["dataset"], r["cell"]) in launched_cells]
     n_ok = sum(1 for r in rows if r["status"] == "ok")
+    n_launched = len(launched_cells) * len(SEEDS)
     ranked = sorted(ranking_rows, key=lambda r: -(r["mean_acc"] or -1e9))
     lines = [
         "# G2_SYSTEM_SYNERGY_REPORT — Full System Synergy Matrix (plan §7)",
         "",
-        f"- runs: {n_ok} OK / {len(rows)} total; failed/missing: {len(failures)}",
+        f"- runs: {n_ok} OK / {n_launched} launched; failed: {len(failures)}",
         f"- cells: 16 factorial (fixed a0_augment, num_blocks=1) + {len(G2_MATCHED_CONTROLS)} matched controls",
         "- statistics: val acc / val f1 at best-val-acc epoch, 3 seeds per cell-dataset",
         "",

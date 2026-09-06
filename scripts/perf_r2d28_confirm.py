@@ -202,7 +202,7 @@ def summarize(e_star: str) -> None:
     if FACTORIAL_ROOT.exists():
         for p in sorted(FACTORIAL_ROOT.rglob("summary.json")):
             d = json.loads(p.read_text(encoding="utf-8"))
-            if d["variant"] == "F9":
+            if d["variant"] in ("F9", "F3"):
                 d["variant"] = candidate
                 rows.append(d)
     rows += load_references(e_star)

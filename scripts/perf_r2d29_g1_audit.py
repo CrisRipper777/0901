@@ -171,14 +171,15 @@ def check_source_channels(model, x, edge_index, num_nodes):
 def check_chunk_equivalence(device):
     from src.models.biaxis_cort_components import cort_coupled_message
     n = 64
+    # torch.Generator is CPU-only (D2.7 pitfall): generate on CPU, then move
     generator = torch.Generator().manual_seed(7)
-    f_block = torch.randn(n, 3, 16, generator=generator, device=device)
-    src = torch.randint(0, n, (n * 6,), generator=generator, device=device)
-    dst = torch.randint(0, n, (n * 6,), generator=generator, device=device)
+    f_block = torch.randn(n, 3, 16, generator=generator).to(device)
+    src = torch.randint(0, n, (n * 6,), generator=generator).to(device)
+    dst = torch.randint(0, n, (n * 6,), generator=generator).to(device)
     edge_index = torch.stack([src, dst])
-    scores = torch.randn(n * 6, generator=generator, device=device)
-    null = torch.randn(n, generator=generator, device=device)
-    payload = torch.randn(n, 16, generator=generator, device=device)
+    scores = torch.randn(n * 6, generator=generator).to(device)
+    null = torch.randn(n, generator=generator).to(device)
+    payload = torch.randn(n, 16, generator=generator).to(device)
     m1, *_ = cort_coupled_message(f_block, edge_index, n, scores, null, payload,
                                   edge_chunk_size=1 << 30)
     m2, *_ = cort_coupled_message(f_block, edge_index, n, scores, null, payload,
@@ -320,12 +321,13 @@ def main() -> None:
     checks["source_channels"] = check_source_channels(model, x, edge_index, num_nodes)
     print(f"[audit] source channels distinct: {checks['source_channels']}", flush=True)
 
-    # H. API contract: inference == eval forward
+    # H. API contract: inference == eval forward (inference returns CPU z by
+    # the framework contract; move it back for the comparison)
     model.eval()
     with torch.no_grad():
         z_eval, *_ = model(x, edge_index)
         z_inf = model.inference(x, edge_index)
-    inf_diff = float((z_eval - z_inf).abs().max().item())
+    inf_diff = float((z_eval - z_inf.to(device)).abs().max().item())
     checks["api_contract"] = {
         "inference_max_abs_diff": inf_diff,
         "z_shape": list(z_eval.shape),

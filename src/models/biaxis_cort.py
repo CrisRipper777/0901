@@ -103,6 +103,10 @@ class Model(P3Model):
                 mean_dup=self.cort_mean_dup,
             )
 
+        # Only the block sets the backbone mode actually uses are built
+        # (unused sets would add ~3.3M dead params each at d=128).
+        needs_main = self.cort_backbone_mode in ("a0_augment", "pre_a0", "replace", "hybrid")
+        needs_pre_post = self.cort_backbone_mode == "sandwich"
         if self.cort_share_blocks:
             # one shared block instance for every application (plan §6.2)
             self.cort_block = make_block()
@@ -111,9 +115,18 @@ class Model(P3Model):
             self.cort_post_blocks = nn.ModuleList()
         else:
             self.cort_block = None
-            self.cort_blocks = nn.ModuleList([make_block() for _ in range(self.cort_num_blocks)])
-            self.cort_pre_blocks = nn.ModuleList([make_block() for _ in range(self.cort_num_blocks_pre)])
-            self.cort_post_blocks = nn.ModuleList([make_block() for _ in range(self.cort_num_blocks_post)])
+            self.cort_blocks = (
+                nn.ModuleList([make_block() for _ in range(self.cort_num_blocks)])
+                if needs_main else nn.ModuleList()
+            )
+            self.cort_pre_blocks = (
+                nn.ModuleList([make_block() for _ in range(self.cort_num_blocks_pre)])
+                if needs_pre_post else nn.ModuleList()
+            )
+            self.cort_post_blocks = (
+                nn.ModuleList([make_block() for _ in range(self.cort_num_blocks_post)])
+                if needs_pre_post else nn.ModuleList()
+            )
 
         # fusion (plan §4.5); legacy = the inherited P0/A0 fusion (which
         # expects the flattened [C|Pt|Pv] concat, not the [N,3,d] block)

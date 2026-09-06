@@ -61,6 +61,16 @@ def resolve_num_neighbors(cfg) -> list[int]:
     return values + [values[-1]] * (num_layers - len(values))
 
 
+def _aux_iteration_keys(mapping: dict | None) -> tuple[str, ...]:
+    """AUX_INFO_KEYS plus any r3_* keys actually present (R3 transition
+    stats, plan §18). Backward compatible: historical models emit none of
+    the extra keys, so their behavior is unchanged."""
+    if not isinstance(mapping, dict):
+        return AUX_INFO_KEYS
+    extra = sorted(k for k in mapping if isinstance(k, str) and k.startswith("r3_"))
+    return AUX_INFO_KEYS + tuple(extra)
+
+
 def update_aux_info_stats(
     sums: dict[str, float],
     counts: dict[str, float],
@@ -69,7 +79,7 @@ def update_aux_info_stats(
 ) -> None:
     if not isinstance(aux_info, dict):
         return
-    for key in AUX_INFO_KEYS:
+    for key in _aux_iteration_keys(aux_info):
         if key not in aux_info:
             continue
         value = aux_info[key]
@@ -89,10 +99,10 @@ def update_aux_info_stats(
 def summarize_aux_info_stats(sums: dict[str, float], counts: dict[str, float]) -> dict[str, float]:
     return {
         key: sums[key] / max(counts.get(key, 0.0), 1e-12)
-        for key in AUX_INFO_KEYS
+        for key in _aux_iteration_keys(sums)
         if key in sums
     }
 
 
 def format_aux_info_stats(stats: dict[str, float]) -> str:
-    return " | ".join(f"{key} {stats[key]:.4f}" for key in AUX_INFO_KEYS if key in stats)
+    return " | ".join(f"{key} {stats[key]:.4f}" for key in _aux_iteration_keys(stats) if key in stats)

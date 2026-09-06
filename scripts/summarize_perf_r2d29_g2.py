@@ -95,7 +95,11 @@ def _cell_mean(cell: str, dataset: str, rows: list[dict], key: str = "val_acc") 
 
 def _interaction_contrast(factors: list[str], dataset: str, cells: dict,
                           rows: list[dict], key: str) -> float | None:
-    """n-way interaction: (1/2^n) sum over cells of (-1)^{#low} mu(cell)."""
+    """n-way interaction in pp: the signed corner-sum over the n factors,
+    averaged over the replicates from the remaining factors (2^(4-n)), so it
+    reads as a difference-of-differences on the same scale as the main
+    effects. Example: I_RS = mean over (W,F) of
+    mu(R1S1WF) - mu(R1S0WF) - mu(R0S1WF) + mu(R0S0WF)."""
     total, count = 0.0, 0
     for cell in cells:
         n_low = sum(1 for f in factors if _cell_level(cell, f) == 0)
@@ -104,7 +108,10 @@ def _interaction_contrast(factors: list[str], dataset: str, cells: dict,
             return None
         total += (-1) ** n_low * mu
         count += 1
-    return total / count if count else None
+    if not count:
+        return None
+    n_repl = 2 ** (len(FACTORS) - len(factors))
+    return total / n_repl
 
 
 def _g0_reference() -> dict:
